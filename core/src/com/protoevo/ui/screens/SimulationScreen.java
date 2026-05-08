@@ -237,6 +237,23 @@ public class SimulationScreen extends ScreenAdapter {
         setEnvStatOptions();
     }
 
+    public EnvironmentRenderer getBaseEnvironmentRenderer() {
+        return (EnvironmentRenderer) environmentRenderer.getBaseRenderer();
+    }
+
+    /**
+     * Low-detail mode: skip the chemical-field overlay and the baked shadow
+     * texture. Both are screen-filling fragment passes and dominate GPU time
+     * on weak hardware. Toggles both flags together.
+     */
+    public void toggleLowDetailMode() {
+        EnvironmentRenderer r = getBaseEnvironmentRenderer();
+        boolean nowLow = r.isRenderChemicals() || r.isRenderShadows();
+        r.setRenderChemicals(!nowLow);
+        r.setRenderShadows(!nowLow);
+        System.out.println("Low-detail mode: " + (nowLow ? "ON (chemicals+shadows hidden)" : "OFF"));
+    }
+
     public void renderEnvironment(float delta) {
         float envLight = Functions.clampedLinearRemap(
                 environment.getLightMap().getEnvLight(),

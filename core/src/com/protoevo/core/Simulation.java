@@ -238,8 +238,20 @@ public class Simulation implements Runnable
 
 	public void run() {
 		while (simulate) {
-			if (paused)
+			if (paused) {
+				// Sleep briefly instead of busy-waiting. The original tight
+				// `if (paused) continue;` pinned a full CPU core whenever the
+				// sim was paused, which starved the render thread enough that
+				// opening a heavy modal screen could make Windows mark the
+				// LWJGL window "not responding".
+				try {
+					Thread.sleep(20);
+				} catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+					return;
+				}
 				continue;
+			}
 
 			update();
 
@@ -273,10 +285,26 @@ public class Simulation implements Runnable
 			return;
 
 		try {
-			float delta = timeDilation * Environment.settings.simulationUpdateDelta.get();
+			// Substep when timeDilation > 1: each substep uses the full safe dt,
+			// so physics/NN stay stable while wall-clock sim time advances faster.
+			// timeDilation < 1 just shrinks dt for slow-mo.
+			float baseDt = Environment.settings.simulationUpdateDelta.get();
+			float td = Math.max(0f, timeDilation);
+			int fullSteps = (int) td;
+			float frac = td - fullSteps;
+			int cap = 64; // safety cap so a runaway dial doesn't lock the thread
+			int toRun = Math.min(fullSteps, cap);
 
 			try {
-				environment.update(delta);
+				for (int i = 0; i < toRun; i++) {
+					environment.update(baseDt);
+					timedEventsManager.update(baseDt);
+				}
+				if (frac > 0f && toRun < cap) {
+					float dt = baseDt * frac;
+					environment.update(dt);
+					timedEventsManager.update(dt);
+				}
 			} catch (Exception e) {
 				writeCrashReport(e);
 				e.printStackTrace();
@@ -285,8 +313,6 @@ public class Simulation implements Runnable
 				repl.close();
 				throw e;
 			}
-
-			timedEventsManager.update(delta);
 
 		} catch (Exception e) {
 			writeCrashReport(e);

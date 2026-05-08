@@ -494,11 +494,59 @@ public class NetworkGenome implements Serializable
 		return new NeuralNetwork(neurons);
 	}
 
+	/**
+	 * Standard NEAT compatibility distance:
+	 *   d = c1*E/N + c2*D/N + c3*Wbar
+	 * where E = excess genes (innovations past the other genome's max),
+	 *       D = disjoint genes (non-matching innovations within range),
+	 *       Wbar = mean absolute weight difference of matching genes,
+	 *       N   = max(|genes|, 1) for normalization.
+	 * Used by the genetic-clusters view to group similar protozoa.
+	 */
 	public float distance(NetworkGenome other)
 	{
-//		int excess = 0;
-//		int disjoint = 0;
-		return 0;
+		if (other == null) return Float.POSITIVE_INFINITY;
+		final float c1 = 1.0f, c2 = 1.0f, c3 = 0.4f;
+
+		SynapseGene[] a = this.synapseGenes;
+		SynapseGene[] b = other.synapseGenes;
+		if (a == null) a = new SynapseGene[0];
+		if (b == null) b = new SynapseGene[0];
+
+		int maxInnovA = -1, maxInnovB = -1;
+		java.util.HashMap<Integer, SynapseGene> mapA = new java.util.HashMap<>();
+		java.util.HashMap<Integer, SynapseGene> mapB = new java.util.HashMap<>();
+		for (SynapseGene g : a) {
+			mapA.put(g.getInnovation(), g);
+			if (g.getInnovation() > maxInnovA) maxInnovA = g.getInnovation();
+		}
+		for (SynapseGene g : b) {
+			mapB.put(g.getInnovation(), g);
+			if (g.getInnovation() > maxInnovB) maxInnovB = g.getInnovation();
+		}
+
+		int excess = 0, disjoint = 0, matching = 0;
+		float weightDiffSum = 0f;
+		int innovCutoff = Math.min(maxInnovA, maxInnovB);
+
+		java.util.HashSet<Integer> allInnov = new java.util.HashSet<>(mapA.keySet());
+		allInnov.addAll(mapB.keySet());
+		for (int innov : allInnov) {
+			boolean inA = mapA.containsKey(innov);
+			boolean inB = mapB.containsKey(innov);
+			if (inA && inB) {
+				matching++;
+				weightDiffSum += Math.abs(mapA.get(innov).getWeight() - mapB.get(innov).getWeight());
+			} else if (innov > innovCutoff) {
+				excess++;
+			} else {
+				disjoint++;
+			}
+		}
+
+		int n = Math.max(Math.max(a.length, b.length), 1);
+		float wbar = matching > 0 ? weightDiffSum / matching : 0f;
+		return c1 * excess / n + c2 * disjoint / n + c3 * wbar;
 	}
 
 	public String toString()

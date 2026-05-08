@@ -70,6 +70,13 @@ public class SimulationInputManager {
             graphics.setScreen(new StatsGraphsScreen(graphics, simulation, simulationScreen));
         });
 
+        // Genetic-clusters snapshot. Wired from the main top bar (not from the
+        // stats screen) to keep the click path short.
+        topBar.createRightBarImageButton("icons/multicell-icon.png", () -> {
+            graphics.setScreen(new com.protoevo.ui.screens.GeneticClustersScreen(
+                    graphics, simulation, simulationScreen));
+        });
+
         possibleSpawnables.put("Plant Cell", () -> Evolvable.createNew(PlantCell.class));
         possibleSpawnables.put("Random Protozoan", () -> Evolvable.createNew(Protozoan.class));
         tryLoadSavedProtozoans();
@@ -97,6 +104,14 @@ public class SimulationInputManager {
         topBar.createLeftBarToggleImageButton(
                 "icons/meander_disabled.png", "icons/meander_enabled.png",
                 simulationScreen::toggleMeandering
+        );
+
+        // Low-detail mode toggle: hides chemicals + shadows for big FPS win.
+        // Using help_icon.png as a stand-in — the asset set has no "graphics
+        // detail" icon. Hotkey F10 does the same thing.
+        topBar.createLeftBarImageButton(
+                "icons/help_icon.png",
+                simulationScreen::toggleLowDetailMode
         );
 
         // Input layers

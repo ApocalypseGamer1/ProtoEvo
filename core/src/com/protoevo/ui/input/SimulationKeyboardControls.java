@@ -21,6 +21,31 @@ public class SimulationKeyboardControls extends InputAdapter {
         keyFunctions.put(Input.Keys.SPACE, simulation::togglePause);
         keyFunctions.put(Input.Keys.F12, screen::toggleUI);
         keyFunctions.put(Input.Keys.ESCAPE, screen::moveToPauseScreen);
+
+        // Speed controls: ] faster, [ slower, \ reset to 1x
+        keyFunctions.put(Input.Keys.RIGHT_BRACKET, () -> bumpSpeed(true));
+        keyFunctions.put(Input.Keys.LEFT_BRACKET, () -> bumpSpeed(false));
+        keyFunctions.put(Input.Keys.BACKSLASH, () -> {
+            simulation.setTimeDilation(1f);
+            System.out.println("Speed: 1.0x");
+        });
+
+        // Perf toggles: F10 low-detail (both), F11 chemicals only.
+        keyFunctions.put(Input.Keys.F10, screen::toggleLowDetailMode);
+        keyFunctions.put(Input.Keys.F11, () -> {
+            var r = screen.getBaseEnvironmentRenderer();
+            r.setRenderChemicals(!r.isRenderChemicals());
+            System.out.println("Render chemicals: " + r.isRenderChemicals());
+        });
+    }
+
+    private void bumpSpeed(boolean faster) {
+        float td = simulation.getTimeDilation();
+        // Speed steps: ..., 0.25, 0.5, 1, 2, 4, 8, 16, 32
+        if (faster) td = (td < 0.25f) ? 0.25f : Math.min(td * 2f, 64f);
+        else        td = (td > 32f)   ? 32f   : Math.max(td * 0.5f, 0.0625f);
+        simulation.setTimeDilation(td);
+        System.out.printf("Speed: %.3fx%n", td);
     }
 
     @Override

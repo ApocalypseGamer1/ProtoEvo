@@ -47,6 +47,15 @@ public class EnvironmentRenderer implements Renderer {
     private final LightRenderer lightRenderer;
     private final Vector2 tmpVec = new Vector2();
     private final Color tmpColor = new Color();
+    // Runtime perf toggles. Default-on to preserve original look; flip via
+    // SimulationInputManager (F10/F11 hotkeys, top-bar button).
+    private boolean renderChemicals = true;
+    private boolean renderShadows = true;
+
+    public boolean isRenderChemicals() { return renderChemicals; }
+    public void setRenderChemicals(boolean v) { renderChemicals = v; }
+    public boolean isRenderShadows() { return renderShadows; }
+    public void setRenderShadows(boolean v) { renderShadows = v; }
 
     public static Sprite loadSprite(String path) {
         Texture texture = new Texture(Gdx.files.internal(path), true);
@@ -121,7 +130,7 @@ public class EnvironmentRenderer implements Renderer {
 
     public void render(float delta) {
         ScreenUtils.clear(backgroundColor);
-        if (chemicalsRenderer != null)
+        if (chemicalsRenderer != null && renderChemicals)
             chemicalsRenderer.render(delta);
 
         batch.enableBlending();
@@ -137,7 +146,8 @@ public class EnvironmentRenderer implements Renderer {
                 .forEachRemaining(p -> drawParticle(delta, p));
         batch.end();
 
-        lightRenderer.render(delta);
+        if (renderShadows)
+            lightRenderer.render(delta);
 
         batch.begin();
         renderRocks();

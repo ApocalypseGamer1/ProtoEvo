@@ -77,6 +77,10 @@ public class SimulationInputManager {
                     graphics, simulation, simulationScreen));
         });
 
+        // Turbo mode: black-screen line-chart fast-forward (F8 hotkey).
+        topBar.createRightBarImageButton("icons/fast_forward.png",
+                simulationScreen::toggleTurboMode);
+
         possibleSpawnables.put("Plant Cell", () -> Evolvable.createNew(PlantCell.class));
         possibleSpawnables.put("Random Protozoan", () -> Evolvable.createNew(Protozoan.class));
         tryLoadSavedProtozoans();

@@ -342,15 +342,23 @@ public abstract class Cell implements Serializable, Coloured, Spawnable {
 		engulfed.removeMass(removeMultiplier * extractedMass, CauseOfDeath.EATEN);
 
 		Food food;
-		if (foodToDigest.containsKey(foodType))
+		if (foodToDigest.containsKey(foodType)) {
 			food = foodToDigest.get(foodType);
-		else {
+			food.addSimpleMass(extractedMass);
+		} else {
+			// Constructor already sets mass=extractedMass; previously this branch
+			// then ALSO called addSimpleMass(extractedMass) below, doubling the
+			// mass of every fresh food chunk.
 			food = new Food(extractedMass, foodType);
 			foodToDigest.put(foodType, food);
 		}
 
-		food.addSimpleMass(extractedMass);
-		food.addEnergy(engulfed.getEnergyAvailable() * extraction);
+		// Energy must be transferred, not duplicated: deplete the victim's
+		// stockpile by the same amount we hand to the food chunk. Without this,
+		// `cell A energy -> meat -> cell B energy` was a free copy.
+		float energyTransferred = engulfed.getEnergyAvailable() * extraction;
+		engulfed.depleteEnergy(energyTransferred);
+		food.addEnergy(energyTransferred);
 
 		for (ComplexMolecule molecule : engulfed.getComplexMolecules()) {
 			if (engulfed.getComplexMoleculeAvailable(molecule) > 0) {

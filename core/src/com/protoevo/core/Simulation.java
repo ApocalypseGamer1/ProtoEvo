@@ -232,7 +232,82 @@ public class Simulation implements Runnable
 			Environment.settings.misc.timeBetweenAutoSaves::get,
 			this::createAutoSave
 		);
+		timedEventsManager.add(
+			() -> homeostasisInterval,
+			this::homeostasisTick
+		);
 	}
+
+	// ===== Homeostatic difficulty controller =====
+	// Periodically nudges plant/meat energy density and the cell energy decay
+	// rate so the protozoa population gravitates toward a target. When the pop
+	// is below target the controller relaxes (more food, slower decay) so a
+	// crashing run can recover. When the pop exceeds target it tightens to
+	// preserve evolutionary pressure (selection only happens when surviving is
+	// non-trivial).
+	//
+	// `scale = sqrt(clamp(pop/target, lo, hi))` is a smooth, asymmetric-bias-free
+	// adjustment: a 4× pop swing only causes a 2× setting swing, avoiding
+	// runaway oscillation. The square root also makes adjustments biggest near
+	// the target where derivative matters and small at the extremes.
+	private boolean homeostasisEnabled = true;
+	private int homeostasisTargetPop = 500;
+	private float homeostasisInterval = 5f; // sim-seconds between adjustments
+	private float homeostasisLastLoggedScale = -1f;
+
+	// Reference values: must match the in-Java defaults set in CellSettings /
+	// SimulationSettings. Adjustments are computed as multipliers of these.
+	private static final float HOMEO_BASE_DECAY = 0.025f;
+	private static final float HOMEO_BASE_PLANT_ED = 2e5f;
+	private static final float HOMEO_BASE_MEAT_ED = 6e5f;
+	private static final float HOMEO_BASE_START_E = 50f;
+
+	private void homeostasisTick() {
+		if (!homeostasisEnabled || environment == null) return;
+		int pop = environment.numberOfProtozoa();
+		if (pop <= 0) return; // already extinct; nothing for the controller to do
+		float ratio = (float) pop / homeostasisTargetPop;
+		ratio = Math.max(0.2f, Math.min(2.5f, ratio));
+		float scale = (float) Math.sqrt(ratio);
+
+		// scale > 1 ⇒ population above target: tighten (less food, faster decay).
+		// scale < 1 ⇒ population below target: relax (more food, slower decay).
+		Environment.settings.cell.energyDecayRate.set(HOMEO_BASE_DECAY * scale);
+		Environment.settings.plantEnergyDensity.set(HOMEO_BASE_PLANT_ED / scale);
+		Environment.settings.meatEnergyDensity.set(HOMEO_BASE_MEAT_ED / scale);
+		Environment.settings.cell.startingAvailableCellEnergy.set(HOMEO_BASE_START_E / scale);
+
+		// Log only when the controller swings meaningfully, so the console
+		// doesn't get spammed when we're holding steady near the target.
+		if (homeostasisLastLoggedScale < 0
+				|| Math.abs(scale - homeostasisLastLoggedScale) > 0.15f) {
+			System.out.printf(
+					"[homeostat] pop=%d  target=%d  scale=%.2f  decay=%.4f  plantED=%.0f%n",
+					pop, homeostasisTargetPop, scale,
+					HOMEO_BASE_DECAY * scale, HOMEO_BASE_PLANT_ED / scale);
+			homeostasisLastLoggedScale = scale;
+		}
+	}
+
+	public boolean isHomeostasisEnabled() { return homeostasisEnabled; }
+	public void setHomeostasisEnabled(boolean enabled) {
+		homeostasisEnabled = enabled;
+		if (!enabled) {
+			// Restore the static defaults so disabling actually disables.
+			Environment.settings.cell.energyDecayRate.set(HOMEO_BASE_DECAY);
+			Environment.settings.plantEnergyDensity.set(HOMEO_BASE_PLANT_ED);
+			Environment.settings.meatEnergyDensity.set(HOMEO_BASE_MEAT_ED);
+			Environment.settings.cell.startingAvailableCellEnergy.set(HOMEO_BASE_START_E);
+		}
+		homeostasisLastLoggedScale = -1f;
+		System.out.println("Homeostat: " + (enabled ? "ON" : "OFF (defaults restored)"));
+	}
+	public int getHomeostasisTargetPop() { return homeostasisTargetPop; }
+	public void setHomeostasisTargetPop(int target) {
+		homeostasisTargetPop = Math.max(10, target);
+		System.out.println("Homeostat target population: " + homeostasisTargetPop);
+	}
+	// ===== end Homeostatic controller =====
 
 	public void cancelPreparation() {}
 
@@ -296,6 +371,14 @@ public class Simulation implements Runnable
 			int toRun = Math.min(fullSteps, cap);
 
 			try {
+				// Run the full env update (including chemicals) on every
+				// substep with the small safe dt. Earlier "skip chemicals on
+				// intermediate substeps" optimizations turned out to break
+				// the chemical field: plant deposits scale fine with delta,
+				// but protozoan EXTRACTION in cellChemicalIO scales linearly
+				// with delta, so batching N substeps' worth into one call
+				// drained surrounding cells to zero in a single tick. Net
+				// effect was an empty plant gradient and population collapse.
 				for (int i = 0; i < toRun; i++) {
 					environment.update(baseDt);
 					timedEventsManager.update(baseDt);

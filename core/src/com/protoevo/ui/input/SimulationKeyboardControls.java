@@ -37,6 +37,14 @@ public class SimulationKeyboardControls extends InputAdapter {
             r.setRenderChemicals(!r.isRenderChemicals());
             System.out.println("Render chemicals: " + r.isRenderChemicals());
         });
+        // Turbo: black screen + line chart + max sim throughput. Good for
+        // leaving the sim running overnight.
+        keyFunctions.put(Input.Keys.F8, screen::toggleTurboMode);
+
+        // Homeostat: dynamically adjust food density / decay rate to track a
+        // target population so evolution always has selection pressure.
+        keyFunctions.put(Input.Keys.F7, () ->
+                simulation.setHomeostasisEnabled(!simulation.isHomeostasisEnabled()));
     }
 
     private void bumpSpeed(boolean faster) {

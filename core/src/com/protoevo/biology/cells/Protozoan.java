@@ -194,12 +194,39 @@ public class Protozoan extends EvolvableCell
 		if (solution == null)
 			return 0;
 
+		// Sample well outside the cell's own footprint, otherwise the readings
+		// are dominated by chemicals the cell itself just consumed — that's
+		// the "surrounded by plants but gradient = 0 or negative" case.
+		// Normalize by the sum so the *direction* signal stays meaningful
+		// when the field is densely saturated front and back.
 		Vector2 pos = getPos();
-		tmp.set(pos).add(dir.setLength(1.1f * getRadius()));
-		float plantGradientAhead = solution.getPlantDensity(tmp);
-		tmp.set(pos).sub(dir.setLength(1.1f * getRadius()));
-		float plantGradientBehind = solution.getPlantDensity(tmp);
-		return plantGradientAhead - plantGradientBehind;
+		float sampleR = 4f * getRadius();
+		tmp.set(pos).add(dir.setLength(sampleR));
+		float plantAhead  = solution.getPlantDensity(tmp);
+		tmp.set(pos).sub(dir.setLength(sampleR));
+		float plantBehind = solution.getPlantDensity(tmp);
+		float sum = plantAhead + plantBehind;
+		if (sum <= 1e-6f) return 0f;
+		return (plantAhead - plantBehind) / sum;
+	}
+
+	@GeneRegulator(name="Plant Density Local", min=0, max=1)
+	public float getPlantDensityLocal() {
+		Optional<Environment> env = getEnv();
+		if (!env.isPresent())
+			return 0;
+		// Direct spatial-hash count of plant CELLS in the same chunk as us.
+		// We deliberately do NOT use the chemical field here: chemicals at
+		// the cell's own position get consumed by the cell's own extraction
+		// pass, so a protozoan sitting on plants reads ~0 chemical — that's
+		// what made the original "Plant Density" signal misleading.
+		// Counting actual plant entities is the correct "I'm in a food
+		// cluster" signal: it reflects ground truth, not a depleted field.
+		Environment e = env.get();
+		int count = e.getLocalCount(PlantCell.class, getPos());
+		int cap = Math.max(1, e.getLocalCapacity(PlantCell.class));
+		float density = (float) count / (float) cap;
+		return density > 1f ? 1f : density;
 	}
 
 	@ControlVariable(name="Cilia Thrust", min=0, max=1)

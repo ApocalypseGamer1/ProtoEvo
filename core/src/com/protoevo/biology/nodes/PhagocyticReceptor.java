@@ -79,8 +79,14 @@ public class PhagocyticReceptor extends NodeAttachment implements Serializable {
 
     private void handleDim3IO(float[] input, float[] output) {
         Cell cell = node.getCell();
-        engulfPlant = input[0] > 0f;
-        engulfMeat = input[1] > 0f;
+        // Default-engulf semantics: a cell that built a phagocytic receptor
+        // engulfs unless the GRN actively *suppresses* it (input < -0.25).
+        // The previous threshold `input > 0` meant random/noisy weights
+        // produced ~50% engulf rate, and combined with conservative NEAT
+        // perturbation many cells never crossed it — they had a working
+        // receptor and starved next to plants.
+        engulfPlant = input[0] > -0.25f;
+        engulfMeat  = input[1] > -0.25f;
 
         if (!((Protozoan) cell).getEngulfedCells().contains(lastEngulfed))
             lastEngulfed = null;
@@ -95,7 +101,8 @@ public class PhagocyticReceptor extends NodeAttachment implements Serializable {
 
     private void handleDim1IO(float[] input, float[] output) {
         Cell cell = node.getCell();
-        engulfPlant = input[0] > 0f;
+        // Same default-engulf semantics as the dim-3 path above.
+        engulfPlant = input[0] > -0.25f;
         engulfMeat = engulfPlant;
 
         if (!((Protozoan) cell).getEngulfedCells().contains(lastEngulfed))

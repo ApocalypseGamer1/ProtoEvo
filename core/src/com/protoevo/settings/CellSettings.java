@@ -9,16 +9,26 @@ public class CellSettings extends Settings {
     public Parameter<Float> energyDecayRate = new Parameter<>(
             "Energy Decay Rate",
             "The rate at which energy storage decays.",
-            .05f
+            // 0.05 → 0.025: gives starving cells ~28s half-life instead of ~14s.
+            // With food yield halved by the bookkeeping fix, the old decay rate
+            // outpaced what wandering protozoa could find by chance, and they
+            // starved before any NN evolution could improve foraging.
+            .025f
     );
+    // Bumped from 1e-3/1e-4. Newborn protozoa are below the 2×minRadius
+    // threshold for engulfing other cells, so their only food source is the
+    // chemical-drip absorption near plants. With my Cell.eat fix removing the
+    // double-mass bug AND with cells defaulting smaller starting energy, the
+    // old 1e-3 conversion rate didn't deliver enough mass for new cells to
+    // grow up to engulf size before starving. 5× bump bootstraps them.
     public final Parameter<Float> chemicalExtractionPlantConversion = new Parameter<>(
             "Chemical Extraction Plant Conversion",
             "The amount of food extracted from plant matter in the chemical solution.",
-            1e-3f);
+            5e-3f);
     public final Parameter<Float> chemicalExtractionMeatConversion = new Parameter<>(
             "Chemical Extraction Meat Conversion",
             "The amount of food extracted from meat matter in the chemical solution.",
-            1e-4f);
+            5e-4f);
     public final Parameter<Float> chemicalExtractionFactor = new Parameter<>(
             "Chemical Extraction Factor",
             "The amount to dilute the chemical solution by when extracting food.",
@@ -62,7 +72,12 @@ public class CellSettings extends Settings {
     public final Parameter<Float> startingAvailableCellEnergy = new Parameter<>(
             "Starting Available Cell Energy",
             "Starting amount of energy available to cells.",
-            1f);
+            // 1 → 50. Cap is 500 (energyCapFactor), so 1 left a fresh cell at
+            // 0.2% of capacity — effectively starving on spawn. Combined with
+            // a 5%/sec decay rate that only worked when the eating bug was
+            // doubling food yield. Bumping to 50 (10% of capacity) gives
+            // newborns time to evolve foraging behavior.
+            50f);
     public final Parameter<Float> energyCapFactor = new Parameter<>(
             "Energy Cap Factor",
             "Maximum energy a cell can have at the minimum size.",

@@ -57,7 +57,11 @@ public class Food implements Serializable {
     }
 
     public void addEnergy(float energy) {
-        mass += energy;
+        // Was: `mass += energy;` — clearly a typo bug. Combined with `addSimpleMass`
+        // double-adding mass and `getEnergy` re-releasing the stored value every
+        // tick at meat density (3e5×), this let cells eat their own corpses for
+        // a 6-figure-multiplier net energy gain. Storing in the right field now.
+        this.energy += energy;
     }
 
     public void subtractSimpleMass(float m) {
@@ -99,8 +103,30 @@ public class Food implements Serializable {
         complexMoleculeMasses.put(molecule, currentMass + mass);
     }
 
+    /**
+     * Release energy proportional to the mass `m` just extracted. Consumes the
+     * proportional fraction of the stored `energy` field, plus density × m for
+     * the meat/plant intrinsic energy.
+     *
+     * Caller in Cell.digest subtracts mass FIRST, then calls this with the
+     * removed mass. So `mass` here is the *remaining* mass after extraction;
+     * `mass + m` reconstructs the pre-extraction total.
+     *
+     * Was: `return energy + density * m;` — released the whole stored energy
+     * every tick, never decrementing it. Combined with the addEnergy/mass-typo
+     * bug above, this was the main "eat your own meat for infinite energy" loop.
+     */
     public float getEnergy(float m) {
-        return energy + type.getEnergyDensity() * m;
+        float prevMass = mass + m;
+        float storedReleased;
+        if (prevMass <= 0f) {
+            // Edge case: no mass left to attribute the release to. Take it all.
+            storedReleased = energy;
+        } else {
+            storedReleased = energy * (m / prevMass);
+        }
+        energy = Math.max(0f, energy - storedReleased);
+        return storedReleased + type.getEnergyDensity() * m;
     }
 
     @Override

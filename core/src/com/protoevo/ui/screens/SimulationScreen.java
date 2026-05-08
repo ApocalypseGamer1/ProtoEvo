@@ -241,6 +241,162 @@ public class SimulationScreen extends ScreenAdapter {
         return (EnvironmentRenderer) environmentRenderer.getBaseRenderer();
     }
 
+    // ===== Turbo mode =====
+    // Black-screen fast-forward: skip all environment rendering, run sim updates
+    // in a tight loop within each render frame, and draw a small line chart of
+    // population over time. Useful for letting the sim evolve overnight.
+    private boolean turboMode = false;
+    private static final int TURBO_SAMPLES_CAP = 600;
+    private final float[] turboSampleTime = new float[TURBO_SAMPLES_CAP];
+    private final int[] turboSampleProto = new int[TURBO_SAMPLES_CAP];
+    private final int[] turboSamplePlants = new int[TURBO_SAMPLES_CAP];
+    private int turboSampleHead = 0, turboSampleSize = 0;
+    private float turboLastSampleSimTime = -1f;
+    private long turboLastLogMs = 0;
+    private int turboLastLoggedProto = -1;
+    private com.badlogic.gdx.graphics.glutils.ShapeRenderer turboShape;
+
+    public void toggleTurboMode() {
+        turboMode = !turboMode;
+        if (turboMode && turboShape == null) {
+            turboShape = new com.badlogic.gdx.graphics.glutils.ShapeRenderer();
+        }
+        System.out.println("Turbo mode: " + (turboMode
+                ? "ON (rendering disabled, max sim throughput)"
+                : "OFF"));
+        if (turboMode) {
+            turboLastLogMs = 0; // force a log on first frame
+        }
+    }
+
+    public boolean isTurboMode() { return turboMode; }
+
+    private void turboMaybeSample() {
+        if (environment == null) return;
+        float simTime = environment.getElapsedTime();
+        if (turboLastSampleSimTime < 0f || simTime - turboLastSampleSimTime >= 1f) {
+            int proto = environment.numberOfProtozoa();
+            int plants = environment.getCount(com.protoevo.biology.cells.PlantCell.class);
+            int slot = turboSampleHead;
+            turboSampleTime[slot] = simTime;
+            turboSampleProto[slot] = proto;
+            turboSamplePlants[slot] = plants;
+            turboSampleHead = (turboSampleHead + 1) % TURBO_SAMPLES_CAP;
+            if (turboSampleSize < TURBO_SAMPLES_CAP) turboSampleSize++;
+            turboLastSampleSimTime = simTime;
+        }
+    }
+
+    private void turboMaybeLog() {
+        if (environment == null) return;
+        long now = System.currentTimeMillis();
+        int proto = environment.numberOfProtozoa();
+        boolean dueByTime = now - turboLastLogMs > 3L * 60L * 1000L;
+        boolean dueByChange = turboLastLoggedProto > 0
+                && Math.abs(proto - turboLastLoggedProto) >= 0.25 * turboLastLoggedProto;
+        if (turboLastLogMs == 0 || dueByTime || dueByChange) {
+            int plants = environment.getCount(com.protoevo.biology.cells.PlantCell.class);
+            System.out.printf("[TURBO] sim=%.1fs  protozoa=%d  plants=%d%n",
+                    environment.getElapsedTime(), proto, plants);
+            turboLastLogMs = now;
+            turboLastLoggedProto = proto;
+        }
+    }
+
+    private void turboRender() {
+        ScreenUtils.clear(0f, 0f, 0f, 1f);
+
+        // Run sim as hard as we can within ~12ms so the render thread still
+        // returns in time for libGDX to process input events (so F8 / ESC
+        // still work). simulation.update() already substeps internally up to
+        // its safety cap, so each call here advances `timeDilation` substeps.
+        long deadline = System.currentTimeMillis() + 12;
+        int iters = 0;
+        while (System.currentTimeMillis() < deadline) {
+            simulation.update();
+            iters++;
+            if (iters >= 1000) break; // safety: don't pin the thread on a fast sim
+        }
+
+        turboMaybeSample();
+        turboMaybeLog();
+
+        // Layout: top 1/8 reserved for status text; rest for line chart.
+        float w = Gdx.graphics.getWidth();
+        float h = Gdx.graphics.getHeight();
+        float marginX = w * 0.06f;
+        float chartTop = h * 0.85f;
+        float chartBottom = h * 0.10f;
+        float chartLeft = marginX;
+        float chartRight = w - marginX;
+
+        // Compute chart bounds.
+        int n = turboSampleSize;
+        if (n >= 2) {
+            float tMin = Float.POSITIVE_INFINITY, tMax = Float.NEGATIVE_INFINITY;
+            int yMax = 1;
+            int start = (turboSampleHead - n + TURBO_SAMPLES_CAP) % TURBO_SAMPLES_CAP;
+            for (int i = 0; i < n; i++) {
+                int idx = (start + i) % TURBO_SAMPLES_CAP;
+                float t = turboSampleTime[idx];
+                if (t < tMin) tMin = t;
+                if (t > tMax) tMax = t;
+                if (turboSampleProto[idx] > yMax) yMax = turboSampleProto[idx];
+                if (turboSamplePlants[idx] > yMax) yMax = turboSamplePlants[idx];
+            }
+            float dt = Math.max(1e-3f, tMax - tMin);
+
+            turboShape.begin(com.badlogic.gdx.graphics.glutils.ShapeRenderer.ShapeType.Line);
+
+            // Frame
+            turboShape.setColor(0.4f, 0.4f, 0.4f, 1f);
+            turboShape.rect(chartLeft, chartBottom,
+                    chartRight - chartLeft, chartTop - chartBottom);
+
+            // Plot helper inline: protozoa green, plants gray.
+            for (int series = 0; series < 2; series++) {
+                if (series == 0) turboShape.setColor(0.4f, 1f, 0.4f, 1f);
+                else turboShape.setColor(0.55f, 0.55f, 0.55f, 1f);
+                float prevX = 0, prevY = 0;
+                for (int i = 0; i < n; i++) {
+                    int idx = (start + i) % TURBO_SAMPLES_CAP;
+                    int v = (series == 0)
+                            ? turboSampleProto[idx]
+                            : turboSamplePlants[idx];
+                    float fx = (turboSampleTime[idx] - tMin) / dt;
+                    float fy = (float) v / yMax;
+                    float x = chartLeft + fx * (chartRight - chartLeft);
+                    float y = chartBottom + fy * (chartTop - chartBottom);
+                    if (i > 0) turboShape.line(prevX, prevY, x, y);
+                    prevX = x; prevY = y;
+                }
+            }
+            turboShape.end();
+        }
+
+        // Status text + legend via the existing UI batch + font.
+        int proto = environment != null ? environment.numberOfProtozoa() : 0;
+        int plants = environment != null
+                ? environment.getCount(com.protoevo.biology.cells.PlantCell.class) : 0;
+        float simT = environment != null ? environment.getElapsedTime() : 0f;
+        uiBatch.begin();
+        font.setColor(1f, 1f, 1f, 1f);
+        String top = String.format(
+                "TURBO MODE  |  protozoa: %d  |  plants: %d  |  sim time: %.1fs  |  iters/frame: %d",
+                proto, plants, simT, iters);
+        font.draw(uiBatch, top, marginX, h - h * 0.04f);
+
+        font.setColor(0.4f, 1f, 0.4f, 1f);
+        font.draw(uiBatch, "protozoa", marginX, chartTop + 18f);
+        font.setColor(0.55f, 0.55f, 0.55f, 1f);
+        font.draw(uiBatch, "plants", marginX + 110f, chartTop + 18f);
+
+        font.setColor(0.6f, 0.6f, 0.6f, 1f);
+        font.draw(uiBatch, "F8 to exit turbo", marginX, chartBottom - 12f);
+        uiBatch.end();
+    }
+    // ===== end Turbo mode =====
+
     /**
      * Low-detail mode: skip the chemical-field overlay and the baked shadow
      * texture. Both are screen-filling fragment passes and dominate GPU time
@@ -265,6 +421,11 @@ public class SimulationScreen extends ScreenAdapter {
 
     @Override
     public void render(float delta) {
+
+        if (turboMode) {
+            turboRender();
+            return;
+        }
 
         conditionalTasks.forEach((condition, task) -> {
             if (condition.get())

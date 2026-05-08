@@ -28,15 +28,21 @@ public class SimulationSettings extends Settings {
 //            "Whether to repopulate the world when all Protozoa go extinct (overrides Finish on Extinction).",
 //            true
 //    );
+    // Doubled from 1e5/3e5. The original eat() code had a bug that double-added
+    // mass to fresh food chunks, so cells got ~2x the energy per meal that the
+    // numbers implied. Fixing the bug halved real food yield, which was enough
+    // to crash populations that previously survived. Bumping the densities
+    // restores roughly the original delivered nutrition without re-introducing
+    // the duplication bug.
     public final Parameter<Float> plantEnergyDensity = new Parameter<>(
             "Plant Energy Density",
             "Energy per unit mass of plant material.",
-            1e5f
+            2e5f
     );
     public final Parameter<Float> meatEnergyDensity = new Parameter<>(
             "Meat Energy Density",
             "Energy per unit mass of meat material.",
-            3e5f
+            6e5f
     );
 
     public final Parameter<Float> meatDeathFactor = new Parameter<>(

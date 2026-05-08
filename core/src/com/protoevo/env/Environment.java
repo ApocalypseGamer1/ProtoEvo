@@ -129,24 +129,45 @@ public class Environment implements Serializable
 
 	public void update(float delta)
 	{
+		update(delta, delta);
+	}
+
+	/**
+	 * Split-delta version for fast-forward substepping.
+	 *
+	 * @param physicsDelta   delta used for the physics step + per-cell update.
+	 *                       MUST be the small per-substep dt — running physics
+	 *                       with a giant accumulated delta produces unstable
+	 *                       behavior (cells tunneling through rocks, etc.).
+	 * @param chemicalsDelta total accumulated delta for the chemical pass.
+	 *                       Pass 0 to skip chemicals this call entirely; pass
+	 *                       the same value as physicsDelta on the last substep
+	 *                       to make the deposit reflect the time we *actually*
+	 *                       advanced. The previous version skipped deposits on
+	 *                       intermediate substeps, which made plants emit ~1/N
+	 *                       as much chemical at N× speed — protozoa lost the
+	 *                       gradient they navigate by, and populations starved.
+	 */
+	public void update(float physicsDelta, float chemicalsDelta)
+	{
 		hasStarted = true;
 		settings = mySettings;
 		for (Cell cell : getCells())
 			cell.getParticle().physicsUpdate();
 
-		timeManager.update(delta);
-		light.update(delta);
+		timeManager.update(physicsDelta);
+		light.update(physicsDelta);
 
-		physics.step(delta);
+		physics.step(physicsDelta);
 
-  		handleCellUpdates(delta);
+  		handleCellUpdates(physicsDelta);
 		handleBirthsAndDeaths();
 		updateChunkAllocations();
 
 		physics.getJointsManager().flushJoints();
 
-		if (Environment.settings.enableChemicalField.get()) {
-			chemicalSolution.update(delta);
+		if (chemicalsDelta > 0f && Environment.settings.enableChemicalField.get()) {
+			chemicalSolution.update(chemicalsDelta);
 		}
 	}
 

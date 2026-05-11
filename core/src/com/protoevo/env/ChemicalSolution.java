@@ -126,10 +126,22 @@ public class ChemicalSolution implements Serializable {
         return (int) Functions.clampedLinearRemap(y, yMin, yMax, 0, chemicalTextureHeight);
     }
 
+    // Dirty flag so the renderer knows when to refresh its pixmap. Volatile
+    // because sim thread writes, render thread reads. We DON'T fire a
+    // per-pixel callback on every set() — at 1024×1024 with a diffuse step
+    // touching every pixel, that was ~1M JNI calls into Pixmap.drawPixel
+    // per chemical-update, ~30ms of pure render-thread tax. Renderer now
+    // batches the whole array into the pixmap once per render frame.
+    private volatile transient boolean chemicalsDirty = false;
+
+    public boolean isDirty() { return chemicalsDirty; }
+    public void clearDirty() { chemicalsDirty = false; }
+
     public void set(int x, int y, Colour colour) {
         if (outOfTextureBounds(x, y))
             return;
         colours[x][y].set(colour);
+        chemicalsDirty = true;
         if (updateChemicalCallback != null)
             updateChemicalCallback.onChemicalUpdated(x, y, colour);
     }
@@ -138,6 +150,7 @@ public class ChemicalSolution implements Serializable {
         if (outOfTextureBounds(x, y))
             return;
         colours[x][y].set(r, g, b, a);
+        chemicalsDirty = true;
         if (updateChemicalCallback != null)
             updateChemicalCallback.onChemicalUpdated(x, y, colours[x][y]);
     }
@@ -146,6 +159,7 @@ public class ChemicalSolution implements Serializable {
         if (outOfTextureBounds(x, y))
             return;
         colours[x][y].set(rgba8888);
+        chemicalsDirty = true;
         if (updateChemicalCallback != null)
             updateChemicalCallback.onChemicalUpdated(x, y, colours[x][y]);
     }
@@ -178,6 +192,9 @@ public class ChemicalSolution implements Serializable {
 
         float cellWorldWidth = getFieldWidth() / chemicalTextureWidth;
         float cellWorldHeight = getFieldHeight() / chemicalTextureHeight;
+        float plantConv = Environment.settings.cell.chemicalExtractionPlantConversion.get();
+        float meatConv = Environment.settings.cell.chemicalExtractionMeatConversion.get();
+        float extractionFactor = Environment.settings.cell.chemicalExtractionFactor.get();
 
         for (int i = -size; i <= size; i++) {
             for (int j = -size; j <= size; j++) {
@@ -197,21 +214,28 @@ public class ChemicalSolution implements Serializable {
                                 worldX, worldY, protozoan.getRadius()
                         );
                         float overlapP = overlapArea / (cellWorldWidth * cellWorldHeight);
-                        float extraction =
-                                Environment.settings.cell.chemicalExtractionFactor.get() * delta * overlapP;
-                        if (extraction > 0) {
-
-                            if (colour.g > 0.5f && colour.g > 1.5f * colour.r && colour.g > 1.5f * colour.b)
+                        float requested = extractionFactor * delta * overlapP;
+                        if (requested > 0) {
+                            // Cap extraction by what's actually present per
+                            // channel. Without this, batching N substeps' worth
+                            // into a single call (fast-forward) silently
+                            // over-credited food: the OLD colour values were
+                            // multiplied into the food yield even after the
+                            // pixel was about to deplete to zero. With the cap,
+                            // the same batched call extracts exactly what's
+                            // there — correct and delta-safe.
+                            if (colour.g > 0.5f && colour.g > 1.5f * colour.r && colour.g > 1.5f * colour.b) {
+                                float effG = Math.min(requested, colour.g);
                                 protozoan.addFood(Food.Type.Plant,
-                                        extraction * colour.g * colour.g
-                                                * Environment.settings.cell.chemicalExtractionPlantConversion.get());
-
-                            if (colour.r > 0.5f && colour.r > 1.5f * colour.g && colour.r > 1.5f * colour.b)
+                                        effG * colour.g * plantConv);
+                            }
+                            if (colour.r > 0.5f && colour.r > 1.5f * colour.g && colour.r > 1.5f * colour.b) {
+                                float effR = Math.min(requested, colour.r);
                                 protozoan.addFood(Food.Type.Meat,
-                                        extraction * colour.r * colour.r
-                                                * Environment.settings.cell.chemicalExtractionMeatConversion.get());
+                                        effR * colour.r * meatConv);
+                            }
 
-                            colour.sub(extraction);
+                            colour.sub(requested);
                             set(fieldX, fieldY, colour);
                         }
                     }

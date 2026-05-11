@@ -54,10 +54,19 @@ public class ProtozoaSettings extends Settings {
 //            "",
 //            "",
 //            maxBirthRadius.get() * 1.2f);
+    // Bumped from 0 → 0.4. The evolvable "Growth Rate" trait gets remapped
+    // from [0,1] to [minGrowthRate, maxGrowthRate]; with a floor of 0, a
+    // lineage that evolved its trait toward 0 had effective growth rate ~0
+    // and never reached split radius, no matter how well it ate. Worse,
+    // construction mass that arrived from feeding got immediately consumed
+    // by the cell's surface nodes (each of which tries to build its
+    // attachment every tick), so the user saw "mass appears then vanishes
+    // with no growth." A non-zero floor guarantees growth wins some of the
+    // mass each tick.
     public final Parameter<Float> minProtozoanGrowthRate = new Parameter<>(
             "Min Growth Rate",
             "The minimum growth factor of a protozoan.",
-            0f);
+            0.4f);
     public final Parameter<Float> maxProtozoanGrowthRate = new Parameter<>(
             "Max Growth Rate",
             "The maximum growth factor of a protozoan.",

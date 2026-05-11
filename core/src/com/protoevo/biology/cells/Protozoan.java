@@ -6,6 +6,7 @@ import com.protoevo.biology.evolution.*;
 import com.protoevo.biology.nn.NeuralNetwork;
 import com.protoevo.biology.nodes.*;
 import com.protoevo.biology.organelles.Organelle;
+import com.protoevo.core.Simulation;
 import com.protoevo.core.Statistics;
 import com.protoevo.env.ChemicalSolution;
 import com.protoevo.env.Environment;
@@ -26,7 +27,38 @@ public class Protozoan extends EvolvableCell
 
 	private GeneExpressionFunction crossOverGenome;
 	private float matingCooldown = 0;
-	private boolean mateDesire, splitDesire = false;
+	// Continuous NN signals in [0,1]. Earlier these were thresholded to a
+	// boolean at 0.5, which collapsed selection: a cell with signal 0.51
+	// behaved identically to one at 1.0, and 0.49 identically to 0.0. That
+	// made it impossible for evolution to find smooth strategies like
+	// "split cautiously when food is plentiful" or "mate rarely". With
+	// continuous signals + per-frame probability, mating/splitting frequency
+	// scales linearly with the output, so the gradient is preserved.
+	// Transient: the GRN re-populates these every expression tick, so old
+	// saves can omit them without losing meaningful state.
+	private transient float mateDesireSignal = 0f;
+	private transient float splitDesireSignal = 0f;
+	// Multi-layered memory. Six latch slots split across three temporal
+	// layers, each with its own blend rate α:
+	//   Fast    (α=0.7): tactical — last few ticks
+	//   Medium  (α=0.3): behavioural — last ~10 ticks
+	//   Slow    (α=0.05): strategic — minutes of sim time
+	// On write, the slot blends new ← (1−α)·old + α·input. This gives the
+	// NN a hierarchy of temporal scales: the same recurrent state can
+	// hold "what just happened" and "what's been true for ages" at the
+	// same time. Each layer's slots are wired as both ControlVariable
+	// (NN writes via setMemoryX) and GeneRegulator (NN reads via
+	// getMemoryX) so they appear automatically in the per-cell NN viz
+	// as named in/out neurons. Transient because the GRN refills them
+	// every tick; old saves can omit them without losing meaningful
+	// state.
+	private static final int MEMORY_SLOTS = 6;
+	private static final float[] MEMORY_ALPHA = {
+			0.7f, 0.7f,   // Fast 0, 1
+			0.3f, 0.3f,   // Medium 0, 1
+			0.05f, 0.05f  // Slow 0, 1
+	};
+	private transient float[] memory;
 	private List<SurfaceNode> surfaceNodes;
 
 	private float damageRate = 0;
@@ -86,7 +118,7 @@ public class Protozoan extends EvolvableCell
 		}
 		engulfedCells.removeIf(this::removeEngulfedCondition);
 
-		if (shouldSplit() && hasNotBurst() && getEnv().isPresent()) {
+		if (shouldSplit(delta) && hasNotBurst() && getEnv().isPresent()) {
 			Environment e = getEnv().get();
 			e.requestBurst(Protozoan.this, Protozoan.class, createChild);
 		}
@@ -98,19 +130,31 @@ public class Protozoan extends EvolvableCell
 	}
 
 	private void handleMating(float delta) {
-		if (Environment.settings.protozoa.matingEnabled.get() && mateDesire && matingCooldown <= 0) {
-			for (Collision contact : getParticle().getContacts()) {
-				Object other = contact.getOther(contact);
-				if (other instanceof Protozoan) {
-					Protozoan protozoan = (Protozoan) other;
-					if (protozoan.mateDesire) {
-						setMate(protozoan);
-						return;
-					}
+		if (matingCooldown > 0) {
+			matingCooldown -= delta;
+			return;
+		}
+		if (!Environment.settings.protozoa.matingEnabled.get())
+			return;
+
+		// Probabilistic per-frame check on a continuous signal — at signal=1
+		// the cell tries to mate ~MATE_BASE_RATE times per second on average,
+		// at signal=0 never. This preserves selection gradients (small
+		// signal → rare mating) instead of a binary threshold that snaps
+		// between full-rate and never. Partner consent uses the same scale.
+		final float MATE_BASE_RATE = 2f;
+		if (Simulation.RANDOM.nextFloat() >= mateDesireSignal * delta * MATE_BASE_RATE)
+			return;
+
+		for (Collision contact : getParticle().getContacts()) {
+			Object other = contact.getOther(contact);
+			if (other instanceof Protozoan) {
+				Protozoan partner = (Protozoan) other;
+				if (Simulation.RANDOM.nextFloat() < partner.mateDesireSignal) {
+					setMate(partner);
+					return;
 				}
 			}
-		} else {
-			matingCooldown -= delta;
 		}
 	}
 
@@ -240,25 +284,89 @@ public class Protozoan extends EvolvableCell
 		this.thrustTurn = Environment.settings.protozoa.maxCiliaTurn.get() * turn;
 	}
 
-	@GeneRegulator(name="Orientation", min=0, max=1)
-	public float getOrientation() {
-		return (float) (thrustAngle % (2 * Math.PI)) / (2 * (float) Math.PI);
+	// The old getOrientation was broken — Java's `%` returns a negative
+	// result for negative operands, so thrustAngle % 2π for any
+	// negative-rotation lineage returned values outside [0,1]. Also: a
+	// single-channel circular value with a discontinuity at the wrap point
+	// is hostile to NN training — the NN sees angle 359° and 1° as far
+	// apart even though they're adjacent. The standard fix is to split
+	// the angle into sin/cos components, both bounded in [-1,1] with no
+	// discontinuity.
+	@GeneRegulator(name="Heading Sin", min=-1, max=1)
+	public float getHeadingSin() {
+		return (float) Math.sin(thrustAngle);
+	}
+	@GeneRegulator(name="Heading Cos", min=-1, max=1)
+	public float getHeadingCos() {
+		return (float) Math.cos(thrustAngle);
 	}
 
+	// getProtozoaSpeed was advertised as min=0,max=1 but `getSpeed()/getRadius()`
+	// can easily exceed 1 (a small fast cell). Clamp into the advertised
+	// range so the NN input isn't silently saturated and lying about the
+	// dynamic range available to it.
 	@GeneRegulator(name="Speed", min=0, max=1)
 	public float getProtozoaSpeed() {
-		return getSpeed() / getRadius();
+		float r = getRadius();
+		if (r <= 1e-9f)
+			return 0f;
+		float s = getSpeed() / r;
+		return s > 1f ? 1f : s;
 	}
 
 	@ControlVariable(name="Mate Desire", min=0, max=1)
 	public void setMateDesire(float mate) {
-		this.mateDesire = mate > 0.5f;
+		this.mateDesireSignal = mate;
 	}
 
 	@ControlVariable(name="Split Desire", min=0, max=1)
 	public void setSplitDesire(float split) {
-		this.splitDesire = split > 0.5f;
+		this.splitDesireSignal = split;
 	}
+
+	// ===== Memory state =====
+	private float[] mem() {
+		if (memory == null) memory = new float[MEMORY_SLOTS];
+		return memory;
+	}
+	/** Apply the layer-specific blend: slot = (1-α)·slot + α·input. */
+	private void writeMemory(int slot, float input) {
+		float[] m = mem();
+		float a = MEMORY_ALPHA[slot];
+		m[slot] = (1f - a) * m[slot] + a * input;
+	}
+
+	@ControlVariable(name="Memory Fast 0", min=-1, max=1)
+	public void setMemoryFast0(float v) { writeMemory(0, v); }
+	@ControlVariable(name="Memory Fast 1", min=-1, max=1)
+	public void setMemoryFast1(float v) { writeMemory(1, v); }
+	@ControlVariable(name="Memory Med 0", min=-1, max=1)
+	public void setMemoryMed0(float v) { writeMemory(2, v); }
+	@ControlVariable(name="Memory Med 1", min=-1, max=1)
+	public void setMemoryMed1(float v) { writeMemory(3, v); }
+	@ControlVariable(name="Memory Slow 0", min=-1, max=1)
+	public void setMemorySlow0(float v) { writeMemory(4, v); }
+	@ControlVariable(name="Memory Slow 1", min=-1, max=1)
+	public void setMemorySlow1(float v) { writeMemory(5, v); }
+
+	@GeneRegulator(name="Memory Fast 0", min=-1, max=1)
+	public float getMemoryFast0() { return mem()[0]; }
+	@GeneRegulator(name="Memory Fast 1", min=-1, max=1)
+	public float getMemoryFast1() { return mem()[1]; }
+	@GeneRegulator(name="Memory Med 0", min=-1, max=1)
+	public float getMemoryMed0() { return mem()[2]; }
+	@GeneRegulator(name="Memory Med 1", min=-1, max=1)
+	public float getMemoryMed1() { return mem()[3]; }
+	@GeneRegulator(name="Memory Slow 0", min=-1, max=1)
+	public float getMemorySlow0() { return mem()[4]; }
+	@GeneRegulator(name="Memory Slow 1", min=-1, max=1)
+	public float getMemorySlow1() { return mem()[5]; }
+
+	/** Read-only view of the memory state, for UI inspection. */
+	public float[] getMemory() {
+		return mem();
+	}
+	// ===== end Memory state =====
 
 	public void generateThrust(float delta) {
 		if (thrustMag <= 1e-12)
@@ -278,9 +386,18 @@ public class Protozoan extends EvolvableCell
 		return 1.05f * splitRadius;
 	}
 
-	private boolean shouldSplit() {
-		return splitDesire && getRadius() >= splitRadius
-				&& getHealth() >= Environment.settings.protozoa.minHealthToSplit.get();
+	private boolean shouldSplit(float delta) {
+		// Hard gates: must be big enough and healthy enough.
+		if (getRadius() < splitRadius)
+			return false;
+		if (getHealth() < Environment.settings.protozoa.minHealthToSplit.get())
+			return false;
+		// Probabilistic check on the continuous NN signal so split rate
+		// scales smoothly with desire instead of snapping at 0.5. At
+		// signal=1 the cell averages ~SPLIT_BASE_RATE splits per second
+		// (still gated by radius/health regrowth between splits).
+		final float SPLIT_BASE_RATE = 1.5f;
+		return Simulation.RANDOM.nextFloat() < splitDesireSignal * delta * SPLIT_BASE_RATE;
 	}
 
 	private Protozoan createSplitChild(float r) {
@@ -456,6 +573,10 @@ public class Protozoan extends EvolvableCell
 		stats.put("Herbivore Factor", herbivoreFactor);
 		stats.putPercentage("Mean Mutation Chance", 100 * geneExpressionFunction.getMeanMutationRate());
 		stats.putCount("Num Mutations", geneExpressionFunction.getMutationCount());
+		if (geneExpressionFunction.getGRNGenome() != null) {
+			stats.put("Lineage Mutation Rate ×",
+					geneExpressionFunction.getGRNGenome().getMutationRateMultiplier());
+		}
 
 		int i = 0;
 		for (LineageTag tag : tags) {
@@ -485,8 +606,21 @@ public class Protozoan extends EvolvableCell
 	}
 
 	public void age(float delta) {
-		damageRate = getRadius() * Environment.settings.protozoa.starvationFactor.get();
-		damage(damageRate * delta, CauseOfDeath.OLD_AGE);
+		// The setting is called "starvationFactor" and described as the rate
+		// of damage WHEN NOT EATING, but the original code applied it every
+		// tick regardless of feeding state — so well-fed cells slowly bled
+		// health and eventually died of HEALTH_TOO_LOW even with full energy
+		// stores. That's the "dying even though they have a ton of energy"
+		// case. Now we honor the setting's documented meaning: only apply
+		// the damage when the cell is actually energy-starved (below 25% of
+		// its current capacity).
+		float energyCap = getRadius()
+				* Environment.settings.cell.energyCapFactor.get();
+		if (energyCap <= 0f || getEnergyAvailable() < 0.25f * energyCap) {
+			damageRate = getRadius()
+					* Environment.settings.protozoa.starvationFactor.get();
+			damage(damageRate * delta, CauseOfDeath.OLD_AGE);
+		}
 	}
 
 	@Override

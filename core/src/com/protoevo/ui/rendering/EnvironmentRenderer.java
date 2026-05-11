@@ -15,6 +15,7 @@ import com.badlogic.gdx.physics.box2d.World;
 import com.badlogic.gdx.utils.ScreenUtils;
 import com.protoevo.biology.cells.Cell;
 import com.protoevo.biology.cells.Protozoan;
+import com.protoevo.biology.nodes.SurfaceNode;
 import com.protoevo.env.Environment;
 import com.protoevo.maths.Functions;
 import com.protoevo.physics.*;
@@ -29,6 +30,8 @@ import space.earlygrey.shapedrawer.ShapeDrawer;
 
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 public class EnvironmentRenderer implements Renderer {
@@ -37,6 +40,11 @@ public class EnvironmentRenderer implements Renderer {
     private final SpriteBatch batch;
     private final Texture particleTexture;
     private final HashMap<Protozoan, ProtozoaRenderer> protozoaRenderers = new HashMap<>();
+    // Per-cell node renderer caches for non-Protozoa cells (currently used by
+    // plants now that they grow surface nodes). Keyed by Cell, not Particle,
+    // because that's what NodeRenderer.isStale() checks for death.
+    private final HashMap<Cell, HashMap<SurfaceNode, NodeRenderer>> nonProtozoaNodeRenderers =
+            new HashMap<>();
     private final Sprite jointSprite;
     private final ShapeRenderer debugRenderer;
     private final ShapeDrawer shapeDrawer;
@@ -137,13 +145,23 @@ public class EnvironmentRenderer implements Renderer {
         batch.setProjectionMatrix(camera.combined);
         // Render Particles
         batch.begin();
-        if (camera.zoom < 3)
-            environment.getJointsManager().getJoinings()
-                    .forEach(this::renderJoinedParticles);
-        environment.getParticles()
-                .filter(p -> !circleNotVisible(p.getPos(), p.getRadius()))
-                .iterator()
-                .forEachRemaining(p -> drawParticle(delta, p));
+        if (camera.zoom < 3) {
+            // Old: getJoinings().forEach(this::renderJoinedParticles) — the
+            // method reference + stream iterator allocated per frame. Use a
+            // plain for loop to keep this hot path allocation-free.
+            for (Joining joining : environment.getJointsManager().getJoinings())
+                renderJoinedParticles(joining);
+        }
+        // Old: getParticles() built a Stream → filter Stream → iterator →
+        // forEachRemaining(lambda). Three allocations per render frame.
+        // Iterate cells directly and pull the particle inline — same logic,
+        // zero per-frame garbage on the visibility-cull pass.
+        for (Cell cell : environment.getCells()) {
+            Particle p = cell.getParticle();
+            if (circleNotVisible(p.getPos(), p.getRadius()))
+                continue;
+            drawParticle(delta, p);
+        }
         batch.end();
 
         if (renderShadows)
@@ -155,6 +173,8 @@ public class EnvironmentRenderer implements Renderer {
 
         protozoaRenderers.entrySet()
                 .removeIf(entry -> entry.getValue().isStale());
+        nonProtozoaNodeRenderers.entrySet()
+                .removeIf(entry -> entry.getKey().isDead());
 
 
         if (DebugMode.isInteractionInfo())
@@ -306,12 +326,27 @@ public class EnvironmentRenderer implements Renderer {
             }
         }
         else {
+            // Plain circle base layer for non-Protozoa cells.
             float x = p.getPos().x - p.getRadius();
             float y = p.getPos().y - p.getRadius();
             float r = p.getRadius() * 2;
-            Color c = p.getUserData(Cell.class).getColor();
+            Cell cell = p.getUserData(Cell.class);
+            Color c = cell.getColor();
             batch.setColor(c.r, c.g, c.b, 1.0f);
             batch.draw(particleTexture, x, y, r, r);
+
+            // Plants now grow surface nodes (spikes / photoreceptors); render
+            // them with the same cached-renderer pattern Protozoa use.
+            List<SurfaceNode> surfaceNodes = cell.getSurfaceNodes();
+            if (surfaceNodes != null && !surfaceNodes.isEmpty()) {
+                Map<SurfaceNode, NodeRenderer> renderers =
+                        nonProtozoaNodeRenderers.computeIfAbsent(cell, k -> new HashMap<>());
+                renderers.entrySet().removeIf(e -> e.getValue().isStale());
+                for (SurfaceNode node : surfaceNodes) {
+                    renderers.computeIfAbsent(node, NodeRenderer::createFor)
+                            .render(delta, batch);
+                }
+            }
         }
     }
 

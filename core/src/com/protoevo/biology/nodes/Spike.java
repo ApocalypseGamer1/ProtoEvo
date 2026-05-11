@@ -18,6 +18,14 @@ public class Spike extends NodeAttachment implements Serializable {
     private static final long serialVersionUID = 1L;
 
     private Vector2 spikePoint = new Vector2();
+    // Reused scratch vectors so Spike.update doesn't allocate two Vector2
+    // per (spike × contact) every frame. With dense melee the GC churn
+    // showed up as noticeable jitter in earlier profiling. Transient +
+    // lazy-init: making them transient avoids breaking older saves whose
+    // Spike objects didn't have these fields, and the lazy check keeps it
+    // safe after deserialisation.
+    private transient Vector2 tmpDir;
+    private transient Vector2 tmpStart;
     private final float attackFactor = 10f;
     private float lastDPS = 0;
     private float extension = 1;
@@ -57,9 +65,18 @@ public class Spike extends NodeAttachment implements Serializable {
         for (Object toInteract : cell.getInteractionQueue()) {
             if (toInteract instanceof Particle && (((Particle) toInteract).getUserData() instanceof Cell)) {
                 Cell other = (Cell) ((Particle) toInteract).getUserData();
-                Vector2 dir = spikePoint.cpy().sub(node.getWorldPosition());
-                Vector2 start = node.getWorldPosition().cpy().sub(other.getPos());
-                float[] ts = Geometry.circleIntersectLineTs(dir, start, other.getRadius());
+                // Don't spike adhered partners — without this, any cluster
+                // that evolved adhesion + spikes would tear itself apart, so
+                // multicellular defensive structures couldn't emerge. Cells
+                // don't recognize bound friends; this rule lets them.
+                if (cell.isAttachedTo(other))
+                    continue;
+                if (tmpDir == null) tmpDir = new Vector2();
+                if (tmpStart == null) tmpStart = new Vector2();
+                Vector2 nodePos = node.getWorldPosition();
+                tmpDir.set(spikePoint).sub(nodePos);
+                tmpStart.set(nodePos).sub(other.getPos());
+                float[] ts = Geometry.circleIntersectLineTs(tmpDir, tmpStart, other.getRadius());
                 if (Geometry.lineIntersectCondition(ts)) {
                     output[0] = 1f;
 

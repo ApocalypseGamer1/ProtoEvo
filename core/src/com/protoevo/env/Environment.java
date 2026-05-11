@@ -53,6 +53,17 @@ public class Environment implements Serializable
 	private final ChemicalSolution chemicalSolution;
 	private final LightManager light;
 	private final TimeManager timeManager;
+	private transient CurrentField currentField;
+	private transient Vector2 currentForce;
+	// Monotonically increasing lineage id counter. Each new cell that isn't
+	// a descendant of an existing one (initial spawn, manual injection)
+	// gets the next value; burst children inherit their parent's lineage id.
+	private long nextLineageId = 1L;
+	// Phylogeny records — keyed by cell id, persists past death so the
+	// tree view can walk parents. Bounded by `pruneDeadLineages()` which
+	// runs periodically. Public-ish via getLineageRecords() for the UI.
+	private final java.util.HashMap<Long, LineageRecord> lineageRecords =
+			new java.util.HashMap<>();
 	private final List<Rock> rocks = new ArrayList<>();
 	private final HashMap<Class<? extends Cell>, Long> bornCounts = new HashMap<>(3);
 	private final HashMap<Class<? extends Cell>, Long> generationCounts = new HashMap<>(3);
@@ -73,6 +84,18 @@ public class Environment implements Serializable
 	private final ConcurrentHashMap<Cell, BurstRequest<? extends Cell>> burstRequests = new ConcurrentHashMap<>();
 	private final Collection<Cell> handledBurstRequests = new ConcurrentLinkedQueue<>();
 	private final CellDeadPredicate isDeadPredicate = new CellDeadPredicate();
+	// Per-frame consumer for the parallel cell-update pass. Reused so each
+	// update doesn't allocate a fresh lambda holder; only the `delta` field
+	// changes per call.
+	private transient CellUpdateConsumer cellUpdateConsumer;
+	// Plant + meat delta accumulator. Their update() is skipped on
+	// intermediate substeps at high time dilation, and the accumulated dt
+	// is applied on the next "plants update" pass so the linear-in-delta
+	// terms (photosynthesis, growth, decay) integrate correctly. Non-linear
+	// edge events (plant-protozoa collision damage pulses) are sampled at
+	// the protozoa-pass cadence instead, which is fine because protozoa
+	// always update every step.
+	private transient float plantPendingDt = 0f;
 
 	public Environment()
 	{
@@ -111,7 +134,41 @@ public class Environment implements Serializable
 		cellsToAdd = new HashSet<>();
 		chunks = new Chunks();
 		chunks.initialise();
-		updateChunkAllocations();
+		forceChunkRebuild();
+		rebuildCurrentField();
+	}
+
+	private void rebuildCurrentField() {
+		// Defensive defaults: a save from before these params existed will
+		// deserialize EnvironmentSettings without them, and even with
+		// CompatibleFieldSerializer the field stays at its constructor
+		// default value (which only runs if Kryo invokes the constructor;
+		// not all instantiator strategies do).
+		float strength = (settings.env != null && settings.env.currentStrength != null)
+				? settings.env.currentStrength.get() : 1.5e-5f;
+		float scale = (settings.env != null && settings.env.currentSpatialScale != null)
+				? settings.env.currentSpatialScale.get() : 4f;
+		float rate = (settings.env != null && settings.env.currentTimeRate != null)
+				? settings.env.currentTimeRate.get() : 0.05f;
+		currentField = new CurrentField(strength, scale, rate);
+		currentForce = new Vector2();
+	}
+
+	private void applyCurrents() {
+		if (currentField == null)
+			rebuildCurrentField();
+		float intensity = settings.env.currentStrength.get();
+		if (intensity <= 0f)
+			return;
+		// Keep CurrentField in sync with the settings so a live tweak via
+		// REPL or UI reflects immediately. Cheap — three field copies.
+		currentField.setIntensity(intensity);
+		float t = timeManager.getTimeElapsed();
+		for (Cell cell : getCells()) {
+			Vector2 p = cell.getPos();
+			currentField.sample(p.x, p.y, t, currentForce);
+			cell.getParticle().applyForce(currentForce);
+		}
 	}
 
 	public boolean hasStarted() {
@@ -124,7 +181,7 @@ public class Environment implements Serializable
 		physics.rebuildTransientFields(this);
 		for (Cell cell : getCells())
 			cell.setEnvironment(this);
-		updateChunkAllocations();
+		forceChunkRebuild();
 	}
 
 	public void update(float delta)
@@ -150,6 +207,22 @@ public class Environment implements Serializable
 	 */
 	public void update(float physicsDelta, float chemicalsDelta)
 	{
+		update(physicsDelta, chemicalsDelta, true);
+	}
+
+	/**
+	 * @param plantsAndMeatThisStep if true, plant + meat cells run their full
+	 *   update this step. Otherwise only protozoa update — used by the fast-
+	 *   forward scheduler so we don't pay for 1500 plant updates on every
+	 *   substep when the per-render budget only fits one or two passes.
+	 *   Plants get a fat-delta update once per render frame instead. Since
+	 *   plant logic is linear in delta (photosynthesis, growth, decay) this
+	 *   integrates correctly; the only thing that loses fidelity is the
+	 *   plant–protozoa contact-death pulse, which evens out over many frames.
+	 */
+	public void update(float physicsDelta, float chemicalsDelta,
+	                   boolean plantsAndMeatThisStep)
+	{
 		hasStarted = true;
 		settings = mySettings;
 		for (Cell cell : getCells())
@@ -158,11 +231,20 @@ public class Environment implements Serializable
 		timeManager.update(physicsDelta);
 		light.update(physicsDelta);
 
-		physics.step(physicsDelta);
+		// Apply environmental current as a per-cell force. Done before the
+		// Box2D step so the force is integrated into this step's motion.
+		// Single-threaded — the math is cheap (a handful of sin/cos per
+		// cell) and avoids the thread-local Vector2 dance you'd need for
+		// a parallelStream.
+		applyCurrents();
 
-  		handleCellUpdates(physicsDelta);
+		if (physicsDelta > 0f)
+			physics.step(physicsDelta);
+
+  		handleCellUpdates(physicsDelta, plantsAndMeatThisStep);
 		handleBirthsAndDeaths();
-		updateChunkAllocations();
+		updateChunkAllocations(physicsDelta);
+		pruneDeadLineages(physicsDelta);
 
 		physics.getJointsManager().flushJoints();
 
@@ -171,13 +253,27 @@ public class Environment implements Serializable
 		}
 	}
 
+
 	public void ensureAddedToEnvironment(Cell cell) {
 		if (!cells.containsKey(cell.getId()))
 			registerToAdd(cell);
 	}
 
-	private void handleCellUpdates(float delta) {
-		getCells().parallelStream().forEach(new CellUpdateConsumer(delta));
+	private void handleCellUpdates(float delta, boolean updatePlantsAndMeat) {
+		if (cellUpdateConsumer == null)
+			cellUpdateConsumer = new CellUpdateConsumer(delta);
+		cellUpdateConsumer.delta = delta;
+		// Plants/meat get caught-up delta on the steps where they actually run.
+		// On skipped steps we accumulate; on running steps they receive
+		// (current delta) + (sum of skipped deltas).
+		if (updatePlantsAndMeat) {
+			cellUpdateConsumer.plantDelta = delta + plantPendingDt;
+			plantPendingDt = 0f;
+		} else {
+			plantPendingDt += delta;
+		}
+		cellUpdateConsumer.updatePlantsAndMeat = updatePlantsAndMeat;
+		getCells().parallelStream().forEach(cellUpdateConsumer);
 	}
 
 	private void handleBirthsAndDeaths() {
@@ -195,13 +291,21 @@ public class Environment implements Serializable
 
 		flushEntitiesToAdd();
 
-		for (Cell cell : getCells()) {
-			if (cell.isDead()) {
-				dispose(cell);
-				depositOnDeath(cell);
-			}
-		}
-		getCells().removeIf(isDeadPredicate);
+		// Single pass: dispose+deposit+remove for any dead cell. The previous
+		// version iterated the map twice (once to dispose/deposit, once to
+		// removeIf) — at large populations that's a measurable repeat scan.
+		// We also pull the cell out of `chunks` here so the spatial index
+		// stays consistent without needing a full clear-and-rebuild on every
+		// frame (see updateChunkAllocations comment).
+		getCells().removeIf(cell -> {
+			if (!cell.isDead())
+				return false;
+			dispose(cell);
+			depositOnDeath(cell);
+			chunks.remove(cell);
+			recordDeath(cell);
+			return true;
+		});
 	}
 
 	public void createRocks() {
@@ -365,11 +469,86 @@ public class Environment implements Serializable
 
 	public void tryAdd(Cell cell) {
 		add(cell);
+		// Assign a founder lineage id if this cell wasn't already tagged
+		// (initial-spawn cells, or any future case where we inject cells
+		// without a parent). Burst children get their parent's id set by
+		// BurstRequest before they hit this path.
+		if (cell.getLineageId() == 0L)
+			cell.setLineageId(nextLineageId++);
+		recordBirth(cell);
 		bornCounts.put(cell.getClass(),
 				bornCounts.getOrDefault(cell.getClass(), 0L) + 1);
 		generationCounts.put(cell.getClass(),
 				Math.max(generationCounts.getOrDefault(cell.getClass(), 0L),
 						 cell.getGeneration()));
+	}
+
+	public long allocateLineageId() {
+		return nextLineageId++;
+	}
+
+	private void recordBirth(Cell cell) {
+		// Only track *protozoa* in the phylogeny. Plants and meat exist in
+		// such churn (a meat pellet's "lineage" is meaningless; plants
+		// barely evolve and 1500 of them swamp the tree with single-cell
+		// chains) that including them turns the tree into a 10k-leaf
+		// hairball nobody can read. The tree is meant to show interesting
+		// evolutionary divergence — that's a protozoa-only concept here.
+		if (!(cell instanceof Protozoan))
+			return;
+		LineageRecord r = new LineageRecord();
+		r.id = cell.getId();
+		r.parentId = cell.getParentId();
+		r.generation = cell.getGeneration();
+		r.birthTime = timeManager.getTimeElapsed();
+		r.deathTime = -1f;
+		r.aliveDescendants = 1;
+		r.cellType = 0; // Protozoan
+		lineageRecords.put(r.id, r);
+		// Propagate the +1 alive-descendants count up the parent chain so
+		// the renderer can prioritise lineages with the most living
+		// descendants without scanning the whole tree every frame.
+		long pid = r.parentId;
+		while (pid != 0L) {
+			LineageRecord p = lineageRecords.get(pid);
+			if (p == null) break;
+			p.aliveDescendants++;
+			pid = p.parentId;
+		}
+	}
+
+	private void recordDeath(Cell cell) {
+		LineageRecord r = lineageRecords.get(cell.getId());
+		if (r == null) return; // plants/meat were never tracked
+		r.deathTime = timeManager.getTimeElapsed();
+		r.aliveDescendants--; // self
+		long pid = r.parentId;
+		while (pid != 0L) {
+			LineageRecord p = lineageRecords.get(pid);
+			if (p == null) break;
+			p.aliveDescendants--;
+			pid = p.parentId;
+		}
+	}
+
+	private float lineagePruneTimer = 0f;
+	/** Drop lineage records whose entire subtree died out long enough ago
+	 *  that they're no longer interesting for the tree view. Keeps the
+	 *  record map bounded — without this it grows with every birth. */
+	private void pruneDeadLineages(float delta) {
+		lineagePruneTimer += delta;
+		if (lineagePruneTimer < 30f) return;
+		lineagePruneTimer = 0f;
+		float now = timeManager.getTimeElapsed();
+		final float keepDeadFor = 120f; // sim-sec of grace
+		lineageRecords.values().removeIf(r ->
+				r.aliveDescendants <= 0
+				&& r.deathTime > 0f
+				&& (now - r.deathTime) > keepDeadFor);
+	}
+
+	public java.util.Map<Long, LineageRecord> getLineageRecords() {
+		return lineageRecords;
 	}
 
 	public void add(Cell cell) {
@@ -391,10 +570,31 @@ public class Environment implements Serializable
 		return chunks.getLocalCount(cellClass);
 	}
 
-	public void updateChunkAllocations() {
+	// Full chunk rebuild is expensive (clear all 1200 sets + re-add every
+	// cell). Births/deaths are now tracked incrementally via chunks.add /
+	// chunks.remove, so the only thing a full rebuild catches is cells that
+	// have *moved* between chunks. Cells take many frames to traverse a chunk,
+	// so stale-by-a-second counts are fine for capacity checks. We still do a
+	// periodic full rebuild to clear any drift. Transient so adding this
+	// field doesn't break older saves.
+	private transient float chunkRebuildTimer = 0f;
+	private static final float CHUNK_REBUILD_INTERVAL = 0.5f;
+
+	public void updateChunkAllocations(float delta) {
+		chunkRebuildTimer += delta;
+		if (chunkRebuildTimer < CHUNK_REBUILD_INTERVAL)
+			return;
+		chunkRebuildTimer = 0f;
 		chunks.clear();
 		for (Cell cell : getCells())
 			chunks.allocate(cell);
+	}
+
+	public void forceChunkRebuild() {
+		chunks.clear();
+		for (Cell cell : getCells())
+			chunks.allocate(cell);
+		chunkRebuildTimer = 0f;
 	}
 
 	private void dispose(Cell e) {
@@ -667,17 +867,26 @@ public class Environment implements Serializable
 	}
 
 	public static class CellUpdateConsumer implements Serializable, Consumer<Cell> {
-		private float delta;
+		float delta;
+		float plantDelta;
+		boolean updatePlantsAndMeat = true;
 
 		public CellUpdateConsumer() {}
 
 		public CellUpdateConsumer(float delta) {
 			this.delta = delta;
+			this.plantDelta = delta;
 		}
 
 		@Override
 		public void accept(Cell cell) {
-			cell.update(delta);
+			if (cell instanceof Protozoan) {
+				cell.update(delta);
+				return;
+			}
+			if (!updatePlantsAndMeat)
+				return;
+			cell.update(plantDelta);
 		}
 	}
 

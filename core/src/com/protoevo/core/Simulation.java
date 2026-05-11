@@ -238,74 +238,290 @@ public class Simulation implements Runnable
 		);
 	}
 
-	// ===== Homeostatic difficulty controller =====
-	// Periodically nudges plant/meat energy density and the cell energy decay
-	// rate so the protozoa population gravitates toward a target. When the pop
-	// is below target the controller relaxes (more food, slower decay) so a
-	// crashing run can recover. When the pop exceeds target it tightens to
-	// preserve evolutionary pressure (selection only happens when surviving is
-	// non-trivial).
+	// ===== Homeostatic difficulty controller (PID) =====
 	//
-	// `scale = sqrt(clamp(pop/target, lo, hi))` is a smooth, asymmetric-bias-free
-	// adjustment: a 4× pop swing only causes a 2× setting swing, avoiding
-	// runaway oscillation. The square root also makes adjustments biggest near
-	// the target where derivative matters and small at the extremes.
+	// Earlier versions used a static `scale = f(pop/target)` lookup that
+	// snapped immediately and capped at fixed multipliers. That was too
+	// rigid — sustained overpopulation didn't cause growing pressure, and
+	// undercrowding didn't get an extra push to recover.
+	//
+	// This is now a proper PID controller on the normalized population error
+	// e(t) = (pop - target) / target. The control signal u(t) =
+	// Kp·e + Ki·∫e dt + Kd·de/dt  is then mapped through per-parameter
+	// exponentials onto the four levers (decay, plant ED, meat ED, plant
+	// contact death). Highlights of the design:
+	//
+	//   • No hard caps. Sustained over-target population grows the integral
+	//     term over time, so pressure mounts continuously — exactly the
+	//     "actively change grazing over time" behavior wanted. The
+	//     parameters never reach zero/infinity because exp() is bounded by
+	//     `MAX_LOG_DEVIATION`.
+	//
+	//   • Derivative damping. When pop is rapidly approaching target the
+	//     derivative term softens the response, preventing the classic
+	//     PI-only oscillate-and-overshoot pattern.
+	//
+	//   • Per-parameter gains. Plant contact-death is a fast lever (high
+	//     gain) — it directly cuts the food supply at its source. Plant
+	//     energy density is a medium lever. Decay rate is slow. Starting
+	//     energy is the gentlest because it only affects future newborns.
+	//
+	//   • Integral anti-windup. The integral is clamped so a long-term
+	//     extinction or runaway can't lock the controller into max output.
+	//
+	//   • Active equilibrium. At pop == target the controller does almost
+	//     nothing; tiny errors are nudged away. Above/below, pressure
+	//     gradually builds — this naturally creates the oscillating
+	//     "active competition" the user wanted, with periods of grazing
+	//     stress alternating with growth windows.
 	private boolean homeostasisEnabled = true;
-	private int homeostasisTargetPop = 500;
-	private float homeostasisInterval = 5f; // sim-seconds between adjustments
-	private float homeostasisLastLoggedScale = -1f;
+	private int homeostasisTargetPop = 250;
+	private int homeostasisTargetPlants = 1000;
+	private float homeostasisInterval = 5f; // sim-seconds between updates
+
+	// PID gains. Levers are all *natural* parameters (food density, decay,
+	// grazing pressure, chemical drip availability) — never a hard population
+	// cap, so the population is shaped by selection, not gated.
+	//
+	// Tuning notes from extensive sim experience:
+	//   • Earlier the integral was hard-capped at ±30. That worked as crude
+	//     anti-windup but ruined fine tracking: once saturated, the lever
+	//     stayed maxed even as pop crossed target, causing big undershoot
+	//     after a big overshoot. Replaced with a *leaky* integral that
+	//     decays a fixed fraction per tick; this prevents windup naturally
+	//     and lets D actually do the fine-correction work.
+	//   • MAX_LOG_DEVIATION was 7 (≈ 1100× lever swing). That capped
+	//     plantED-style levers at 0.001 — not zero. Bumped to 18 so exp
+	//     can produce effectively-zero multipliers when the controller
+	//     needs to fully shut down a food source.
+	//   • Kd doubled to 3.0 — damps the discrete-PID oscillation that
+	//     comes from a 5-second tick observing a population that can
+	//     change by 10%+ between ticks.
+	private static final float PID_KP = 1.1f;
+	private static final float PID_KI = 0.06f;
+	private static final float PID_KD = 3.0f;
+	private static final float PID_INTEGRAL_LEAK = 0.08f; // per tick
+	private static final float MAX_LOG_DEVIATION = 18f;   // exp(-18) ≈ 1.5e-8 (effectively zero)
+
+	// Per-parameter gains. Sign = direction (positive control = more pressure):
+	//   over-target → less food, faster decay, gentler newborn energy.
+	// All levers are *consumption-side* now. Earlier we also drove
+	// `plant.collisionDestructionRate` (kill plants on grazer contact harder
+	// when protozoa over target) — but that backfired: dead plants become
+	// MEAT which then feeds the same overpopulated protozoa we're trying to
+	// starve. It also caused thousands of plant deaths per second at high u
+	// since the lever was unbounded. Plant abundance is now solely the plant
+	// PID's job, leaving this controller to throttle food and accelerate
+	// starvation.
+	private static final float GAIN_DECAY        = 0.8f;
+	private static final float GAIN_PLANT_ED     = -0.85f;
+	private static final float GAIN_MEAT_ED      = -0.7f;
+	private static final float GAIN_START_E      = -0.5f;
+	// New lever: chemical extraction throttle. Plants saturate the chem
+	// field regardless of food yield per mass, so even when plantED is at
+	// 0.001× the drip still feeds protozoa hundreds of energy/sec — the
+	// drip volume itself must be cut to actually starve the population.
+	private static final float GAIN_CHEM_EXTRACT = -1.5f;
+
+	private float pidIntegral = 0f;
+	private float pidLastError = Float.NaN;
+	private long pidLastLogMs = 0;
+
+	// Plant-side PID. Same leaky-integral / high-Kd structure as the
+	// protozoa controller. Slightly softer Kp (plants react slower than
+	// protozoa to setting changes, so we want gentler proportional gain
+	// to avoid chasing noise) and a stronger Kd (plant lifecycle is on
+	// the same time-scale as the controller tick, so damping matters more).
+	private static final float PLANT_PID_KP = 0.9f;
+	private static final float PLANT_PID_KI = 0.05f;
+	private static final float PLANT_PID_KD = 4.0f;
+	private static final float PLANT_PID_INTEGRAL_LEAK = 0.10f;
+
+	// Plant levers. Photosynthesis is the heavy lever — directly controls
+	// energy income, which combined with the universal starvation damage
+	// gives selection pressure with teeth. Construction rate limits how
+	// much mass a plant has for growth/repair. Growth rate caps how fast
+	// they reach split radius. Split-health threshold makes splitting
+	// impossible when over-target (threshold > 1 → no plant can split).
+	// The new plantSplitRate lever directly scales the probabilistic
+	// split rate so even healthy mature plants slow their reproduction
+	// when over-target, instead of the old "instant burst on reaching
+	// maxRadius" that caused the divide-then-die churn.
+	private static final float GAIN_PLANT_PHOTOSYNTHESIS = -1.0f;
+	private static final float GAIN_PLANT_CONSTRUCTION   = -0.8f;
+	private static final float GAIN_PLANT_GROWTH         = -0.7f;
+	private static final float GAIN_PLANT_SPLIT_HEALTH   = 1.2f;
+	private static final float GAIN_PLANT_SPLIT_RATE     = -1.3f;
+
+	private float plantPidIntegral = 0f;
+	private float plantPidLastError = Float.NaN;
 
 	// Reference values: must match the in-Java defaults set in CellSettings /
-	// SimulationSettings. Adjustments are computed as multipliers of these.
+	// SimulationSettings. Multipliers are computed relative to these.
 	private static final float HOMEO_BASE_DECAY = 0.025f;
 	private static final float HOMEO_BASE_PLANT_ED = 2e5f;
 	private static final float HOMEO_BASE_MEAT_ED = 6e5f;
 	private static final float HOMEO_BASE_START_E = 50f;
+	private static final float HOMEO_BASE_CHEM_EXTRACT = 100f;
+	private static final float HOMEO_BASE_PLANT_PHOTOSYNTHESIS = 300f;
+	private static final float HOMEO_BASE_PLANT_CONSTRUCTION = 10f;
+	private static final float HOMEO_BASE_PLANT_MAX_GROWTH = 1.5f;
+	private static final float HOMEO_BASE_PLANT_MIN_GROWTH = 0f;
+	private static final float HOMEO_BASE_PLANT_SPLIT_HEALTH = 0.15f;
+	// Per-second probability a mature plant splits this update. Baseline
+	// gives ~30 sim-sec adult lifetime before splitting; the PID scales
+	// this to throttle reproduction without snapping it fully off.
+	private static final float HOMEO_BASE_PLANT_SPLIT_RATE = 1f / 30f;
+
 
 	private void homeostasisTick() {
 		if (!homeostasisEnabled || environment == null) return;
+		// Run the plant controller alongside the protozoa one — they target
+		// different populations with different levers, so they can't interfere.
+		plantHomeostasisTick();
 		int pop = environment.numberOfProtozoa();
-		if (pop <= 0) return; // already extinct; nothing for the controller to do
-		float ratio = (float) pop / homeostasisTargetPop;
-		ratio = Math.max(0.2f, Math.min(2.5f, ratio));
-		float scale = (float) Math.sqrt(ratio);
-
-		// scale > 1 ⇒ population above target: tighten (less food, faster decay).
-		// scale < 1 ⇒ population below target: relax (more food, slower decay).
-		Environment.settings.cell.energyDecayRate.set(HOMEO_BASE_DECAY * scale);
-		Environment.settings.plantEnergyDensity.set(HOMEO_BASE_PLANT_ED / scale);
-		Environment.settings.meatEnergyDensity.set(HOMEO_BASE_MEAT_ED / scale);
-		Environment.settings.cell.startingAvailableCellEnergy.set(HOMEO_BASE_START_E / scale);
-
-		// Log only when the controller swings meaningfully, so the console
-		// doesn't get spammed when we're holding steady near the target.
-		if (homeostasisLastLoggedScale < 0
-				|| Math.abs(scale - homeostasisLastLoggedScale) > 0.15f) {
-			System.out.printf(
-					"[homeostat] pop=%d  target=%d  scale=%.2f  decay=%.4f  plantED=%.0f%n",
-					pop, homeostasisTargetPop, scale,
-					HOMEO_BASE_DECAY * scale, HOMEO_BASE_PLANT_ED / scale);
-			homeostasisLastLoggedScale = scale;
+		if (pop <= 0) {
+			// Extinct: don't update. Reset integral so when life returns
+			// we don't yank the world into an over-tight state.
+			pidIntegral = 0f;
+			pidLastError = Float.NaN;
+			return;
 		}
+
+		// Normalized error: positive = over target, negative = under.
+		float error = ((float) pop - homeostasisTargetPop) / (float) homeostasisTargetPop;
+
+		// Leaky integral: each tick decays the accumulated integral by a
+		// fixed fraction, then adds current error. This bounds the integral
+		// naturally (steady-state I = error * interval / leak) without the
+		// hard clamp that caused undershoot after a big overshoot.
+		pidIntegral = pidIntegral * (1f - PID_INTEGRAL_LEAK) + error * homeostasisInterval;
+
+		// Derivative term — first call has no history, treat as zero.
+		float derivative = 0f;
+		if (!Float.isNaN(pidLastError))
+			derivative = (error - pidLastError) / homeostasisInterval;
+		pidLastError = error;
+
+		float control = PID_KP * error + PID_KI * pidIntegral + PID_KD * derivative;
+
+		// Apply per-parameter exponential mapping. This keeps multipliers
+		// strictly positive and bounded (no zeros, no infinities).
+		Environment.settings.cell.energyDecayRate.set(
+				HOMEO_BASE_DECAY * mul(GAIN_DECAY * control));
+		Environment.settings.plantEnergyDensity.set(
+				HOMEO_BASE_PLANT_ED * mul(GAIN_PLANT_ED * control));
+		Environment.settings.meatEnergyDensity.set(
+				HOMEO_BASE_MEAT_ED * mul(GAIN_MEAT_ED * control));
+		Environment.settings.cell.startingAvailableCellEnergy.set(
+				HOMEO_BASE_START_E * mul(GAIN_START_E * control));
+		Environment.settings.cell.chemicalExtractionFactor.set(
+				HOMEO_BASE_CHEM_EXTRACT * mul(GAIN_CHEM_EXTRACT * control));
+
+		// Log roughly every 30 seconds so an overnight run leaves a record
+		// of how the controller reacted, without spamming during steady state.
+		long now = System.currentTimeMillis();
+		if (pidLastLogMs == 0 || now - pidLastLogMs > 30_000L) {
+			int plantPop = environment.getCount(com.protoevo.biology.cells.PlantCell.class);
+			float plantCtrl = PLANT_PID_KP * ((plantPop - homeostasisTargetPlants) / (float) homeostasisTargetPlants)
+					+ PLANT_PID_KI * plantPidIntegral;
+			System.out.printf(
+					"[homeostat] proto=%d/%d err=%+.2f u=%+.2f decayx%.2f plantEDx%.3f chemDripx%.3f  "
+					+ "plants=%d/%d uP=%+.2f photoSynx%.3f splitRatex%.3f%n",
+					pop, homeostasisTargetPop, error, control,
+					mul(GAIN_DECAY * control), mul(GAIN_PLANT_ED * control),
+					mul(GAIN_CHEM_EXTRACT * control),
+					plantPop, homeostasisTargetPlants, plantCtrl,
+					mul(GAIN_PLANT_PHOTOSYNTHESIS * plantCtrl),
+					mul(GAIN_PLANT_SPLIT_RATE * plantCtrl));
+			pidLastLogMs = now;
+		}
+	}
+
+	private void plantHomeostasisTick() {
+		int plantPop = environment.getCount(com.protoevo.biology.cells.PlantCell.class);
+		if (plantPop <= 0) {
+			// All plants gone: clear integral so when seedlings return the
+			// world isn't already pressed all the way to no-photosynthesis.
+			plantPidIntegral = 0f;
+			plantPidLastError = Float.NaN;
+			return;
+		}
+
+		float error = ((float) plantPop - homeostasisTargetPlants) / (float) homeostasisTargetPlants;
+		plantPidIntegral = plantPidIntegral * (1f - PLANT_PID_INTEGRAL_LEAK)
+				+ error * homeostasisInterval;
+
+		float derivative = 0f;
+		if (!Float.isNaN(plantPidLastError))
+			derivative = (error - plantPidLastError) / homeostasisInterval;
+		plantPidLastError = error;
+
+		float control = PLANT_PID_KP * error + PLANT_PID_KI * plantPidIntegral + PLANT_PID_KD * derivative;
+
+		Environment.settings.plant.photosynthesizeEnergyRate.set(
+				HOMEO_BASE_PLANT_PHOTOSYNTHESIS * mul(GAIN_PLANT_PHOTOSYNTHESIS * control));
+		Environment.settings.plant.constructionRate.set(
+				HOMEO_BASE_PLANT_CONSTRUCTION * mul(GAIN_PLANT_CONSTRUCTION * control));
+		Environment.settings.plant.maxPlantGrowth.set(
+				HOMEO_BASE_PLANT_MAX_GROWTH * mul(GAIN_PLANT_GROWTH * control));
+		Environment.settings.plant.minPlantGrowth.set(
+				HOMEO_BASE_PLANT_MIN_GROWTH * mul(GAIN_PLANT_GROWTH * control));
+		Environment.settings.plant.minHealthToSplit.set(
+				HOMEO_BASE_PLANT_SPLIT_HEALTH * mul(GAIN_PLANT_SPLIT_HEALTH * control));
+		Environment.settings.plant.splitRate.set(
+				HOMEO_BASE_PLANT_SPLIT_RATE * mul(GAIN_PLANT_SPLIT_RATE * control));
+	}
+
+	/** Map a log-deviation into a positive multiplier, clamped so neither
+	 *  end can produce 0 or runaway values. */
+	private static float mul(float x) {
+		if (x >  MAX_LOG_DEVIATION) x =  MAX_LOG_DEVIATION;
+		if (x < -MAX_LOG_DEVIATION) x = -MAX_LOG_DEVIATION;
+		return (float) Math.exp(x);
 	}
 
 	public boolean isHomeostasisEnabled() { return homeostasisEnabled; }
 	public void setHomeostasisEnabled(boolean enabled) {
 		homeostasisEnabled = enabled;
 		if (!enabled) {
-			// Restore the static defaults so disabling actually disables.
+			// Restore baselines AND reset PID state so re-enabling later
+			// starts from a clean slate, not the integral we'd built up.
 			Environment.settings.cell.energyDecayRate.set(HOMEO_BASE_DECAY);
 			Environment.settings.plantEnergyDensity.set(HOMEO_BASE_PLANT_ED);
 			Environment.settings.meatEnergyDensity.set(HOMEO_BASE_MEAT_ED);
 			Environment.settings.cell.startingAvailableCellEnergy.set(HOMEO_BASE_START_E);
+			Environment.settings.cell.chemicalExtractionFactor.set(HOMEO_BASE_CHEM_EXTRACT);
+			Environment.settings.plant.photosynthesizeEnergyRate.set(HOMEO_BASE_PLANT_PHOTOSYNTHESIS);
+			Environment.settings.plant.constructionRate.set(HOMEO_BASE_PLANT_CONSTRUCTION);
+			Environment.settings.plant.maxPlantGrowth.set(HOMEO_BASE_PLANT_MAX_GROWTH);
+			Environment.settings.plant.minPlantGrowth.set(HOMEO_BASE_PLANT_MIN_GROWTH);
+			Environment.settings.plant.minHealthToSplit.set(HOMEO_BASE_PLANT_SPLIT_HEALTH);
+			Environment.settings.plant.splitRate.set(HOMEO_BASE_PLANT_SPLIT_RATE);
+			pidIntegral = 0f;
+			pidLastError = Float.NaN;
+			plantPidIntegral = 0f;
+			plantPidLastError = Float.NaN;
+			pidLastLogMs = 0;
 		}
-		homeostasisLastLoggedScale = -1f;
 		System.out.println("Homeostat: " + (enabled ? "ON" : "OFF (defaults restored)"));
 	}
 	public int getHomeostasisTargetPop() { return homeostasisTargetPop; }
 	public void setHomeostasisTargetPop(int target) {
 		homeostasisTargetPop = Math.max(10, target);
+		// Reset integral so the controller doesn't carry over windup from the
+		// old setpoint into the new one — common cause of big initial swings
+		// after a target change.
+		pidIntegral = 0f;
+		pidLastError = Float.NaN;
 		System.out.println("Homeostat target population: " + homeostasisTargetPop);
+	}
+	public int getHomeostasisTargetPlants() { return homeostasisTargetPlants; }
+	public void setHomeostasisTargetPlants(int target) {
+		homeostasisTargetPlants = Math.max(10, target);
+		plantPidIntegral = 0f;
+		plantPidLastError = Float.NaN;
+		System.out.println("Homeostat target plants: " + homeostasisTargetPlants);
 	}
 	// ===== end Homeostatic controller =====
 
@@ -360,33 +576,62 @@ public class Simulation implements Runnable
 			return;
 
 		try {
-			// Substep when timeDilation > 1: each substep uses the full safe dt,
-			// so physics/NN stay stable while wall-clock sim time advances faster.
-			// timeDilation < 1 just shrinks dt for slow-mo.
+			// Sim-time advancement model:
+			//   one render call advances sim time by `timeDilation` × baseDt.
+			// At low td we run the inner loop with dt=baseDt (small, stable).
+			// At high td we'd otherwise call physics+cell update hundreds of
+			// times per frame; instead we use BIGGER physics steps capped at a
+			// stability ceiling that grows with td, so 128× ends up doing
+			// ~8 medium steps per render frame instead of 128 tiny ones. Cell
+			// logic is linear in dt so batching is safe; physics has loads of
+			// headroom because max cell speed is ~0.05 units/s (terminal
+			// velocity under fluid damping 10 with cilia thrust 0.0005); even
+			// dt=0.05 won't tunnel a 0.02-radius cell. Chemicals need the
+			// per-pixel cap in protozoanIO (already in place) to be safe.
 			float baseDt = Environment.settings.simulationUpdateDelta.get();
 			float td = Math.max(0f, timeDilation);
-			int fullSteps = (int) td;
-			float frac = td - fullSteps;
-			int cap = 64; // safety cap so a runaway dial doesn't lock the thread
-			int toRun = Math.min(fullSteps, cap);
+			float totalDt = td * baseDt;
+
+			// Stability ceiling scales with time dilation so the per-render
+			// step count stays small even at very high td. Max cell speed is
+			// ~0.05 units/s, min radius ~0.02, so even dt=0.1s only moves a
+			// cell 1/4 of its diameter per step — Box2D handles this fine.
+			// At td=1×: stepDt = 8×baseDt = 0.008 (1 step per render)
+			// At td=32: stepDt = 8×baseDt → 4 steps per render
+			// At td=128: stepDt = 32×baseDt = 0.032 → 4 steps per render
+			// At td=256: stepDt = 64×baseDt = 0.064 → 4 steps per render
+			float maxStableStep = baseDt * Math.min(64f, Math.max(8f, td / 4f));
+			// Per-render-frame cap on the number of big steps. Above this the
+			// sim just won't keep up — better to run slow than hang.
+			int maxStepsPerFrame = 16;
 
 			try {
-				// Run the full env update (including chemicals) on every
-				// substep with the small safe dt. Earlier "skip chemicals on
-				// intermediate substeps" optimizations turned out to break
-				// the chemical field: plant deposits scale fine with delta,
-				// but protozoan EXTRACTION in cellChemicalIO scales linearly
-				// with delta, so batching N substeps' worth into one call
-				// drained surrounding cells to zero in a single tick. Net
-				// effect was an empty plant gradient and population collapse.
-				for (int i = 0; i < toRun; i++) {
-					environment.update(baseDt);
-					timedEventsManager.update(baseDt);
-				}
-				if (frac > 0f && toRun < cap) {
-					float dt = baseDt * frac;
-					environment.update(dt);
-					timedEventsManager.update(dt);
+				// Chemicals AND plant/meat updates are batched once per render
+				// frame. Both are expensive (chem deposit is a parallel stream
+				// over all cells painting their footprint; plant cell updates
+				// are 1500× per pass and mostly do linear-in-delta work) and
+				// neither benefits from sub-frame granularity. Per-pixel
+				// extraction cap in protozoanIO makes the chem batching safe;
+				// plant/meat batching is safe because their update is linear
+				// in delta and Environment accumulates skipped dt internally.
+				// Protozoa still update every step — they're the active
+				// agents and need sub-frame collision/eating fidelity.
+				float remaining = totalDt;
+				float pendingChem = 0f;
+				int stepsThisFrame = 0;
+				while (remaining > 1e-9f && stepsThisFrame < maxStepsPerFrame) {
+					float stepDt = Math.min(remaining, maxStableStep);
+					pendingChem += stepDt;
+					boolean isLastStep =
+							(remaining - stepDt) <= 1e-9f
+							|| (stepsThisFrame + 1) >= maxStepsPerFrame;
+					float chemDt = isLastStep ? pendingChem : 0f;
+					environment.update(stepDt, chemDt, isLastStep);
+					timedEventsManager.update(stepDt);
+					if (isLastStep)
+						pendingChem = 0f;
+					remaining -= stepDt;
+					stepsThisFrame++;
 				}
 			} catch (Exception e) {
 				writeCrashReport(e);

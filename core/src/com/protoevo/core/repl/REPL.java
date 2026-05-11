@@ -29,6 +29,8 @@ public class REPL implements Runnable
                 new SimParams(this),
                 new ManageRemoteGraphics(this),
                 new Screenshot(this),
+                new Homeostat(this),
+                new DumpGenome(this),
         };
 
         for (Command command : commandsList) {

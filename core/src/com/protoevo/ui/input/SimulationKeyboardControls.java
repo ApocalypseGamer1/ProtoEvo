@@ -20,6 +20,7 @@ public class SimulationKeyboardControls extends InputAdapter {
 
         keyFunctions.put(Input.Keys.SPACE, simulation::togglePause);
         keyFunctions.put(Input.Keys.F12, screen::toggleUI);
+        keyFunctions.put(Input.Keys.F4, screen::toggleLineageOverlay);
         keyFunctions.put(Input.Keys.ESCAPE, screen::moveToPauseScreen);
 
         // Speed controls: ] faster, [ slower, \ reset to 1x
@@ -49,8 +50,8 @@ public class SimulationKeyboardControls extends InputAdapter {
 
     private void bumpSpeed(boolean faster) {
         float td = simulation.getTimeDilation();
-        // Speed steps: ..., 0.25, 0.5, 1, 2, 4, 8, 16, 32
-        if (faster) td = (td < 0.25f) ? 0.25f : Math.min(td * 2f, 64f);
+        // Speed steps: ..., 0.25, 0.5, 1, 2, 4, 8, 16, 32, 64, 128, 256
+        if (faster) td = (td < 0.25f) ? 0.25f : Math.min(td * 2f, 256f);
         else        td = (td > 32f)   ? 32f   : Math.max(td * 0.5f, 0.0625f);
         simulation.setTimeDilation(td);
         System.out.printf("Speed: %.3fx%n", td);

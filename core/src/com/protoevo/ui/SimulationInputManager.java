@@ -103,7 +103,13 @@ public class SimulationInputManager {
         topBar.createLeftBarImageButton("icons/fast_forward.png", simulation::toggleTimeDilation);
         topBar.createLeftBarImageButton("icons/home_icon.png", simulationScreen::resetCamera);
         topBar.createLeftBarImageButton("icons/folder.png", simulation::openSaveFolderOnDesktop);
-        topBar.createLeftBarImageButton("icons/terminal.png", graphics::switchToHeadlessMode);
+        // Removed: the "terminal" button called switchToHeadlessMode, which
+        // tore down the OpenGL context. The chemical solution's diffusion
+        // pass uses a GL compute shader though, so the next sim tick after
+        // the button click would crash with no GL context. The REPL is
+        // already running on its own thread reading the launching
+        // terminal's stdin — the button never gave any new functionality,
+        // it just destroyed the window.
 
         topBar.createLeftBarToggleImageButton(
                 "icons/meander_disabled.png", "icons/meander_enabled.png",

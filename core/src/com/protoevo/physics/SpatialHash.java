@@ -6,10 +6,9 @@ import com.badlogic.gdx.math.Vector2;
 import java.io.Serializable;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.Comparator;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentSkipListSet;
 
 public class SpatialHash<T> implements Serializable, Iterable<Collection<T>> {
     
@@ -79,19 +78,23 @@ public class SpatialHash<T> implements Serializable, Iterable<Collection<T>> {
     public boolean add(T t, int i, int j) {
         int idx = getChunkIndex(i, j);
 
-        Collection<T> chunk;
-        if (!chunkContents.containsKey(idx)) {
-            chunk = new ConcurrentSkipListSet<>(Comparator.comparingInt(Object::hashCode));
+        // ConcurrentSkipListSet was overkill — chunk writes only happen on
+        // the main thread (Chunks.add via flushEntitiesToAdd /
+        // updateChunkAllocations), and reads during cell.update parallelStream
+        // are non-mutating. Plain HashSet has O(1) size() instead of skip
+        // list's O(n) traversal — getGlobalCount and capacity checks fire
+        // dozens of times per frame so this matters.
+        Collection<T> chunk = chunkContents.get(idx);
+        if (chunk == null) {
+            chunk = new HashSet<>(8);
             chunkContents.put(idx, chunk);
-        } else {
-            chunk = chunkContents.get(idx);
         }
 
         if (chunk.size() >= maxObjectsPerChunk)
             return false;
 
-        chunk.add(t);
-        size++;
+        if (chunk.add(t))
+            size++;
 
         return true;
     }
@@ -102,6 +105,24 @@ public class SpatialHash<T> implements Serializable, Iterable<Collection<T>> {
         int y = getChunkY(pos.y);
 
         return add(t, x, y);
+    }
+
+    public boolean remove(T t, Vector2 pos) {
+        int idx = getChunkIndex(getChunkX(pos.x), getChunkY(pos.y));
+        Collection<T> chunk = chunkContents.get(idx);
+        if (chunk != null && chunk.remove(t)) {
+            size--;
+            return true;
+        }
+        // Fallback: cell may have been counted in a different chunk than its
+        // current pos (it moved since last add). Linear scan — uncommon path.
+        for (Collection<T> any : chunkContents.values()) {
+            if (any.remove(t)) {
+                size--;
+                return true;
+            }
+        }
+        return false;
     }
 
     public boolean add(T t, Vector2[] bounds) {

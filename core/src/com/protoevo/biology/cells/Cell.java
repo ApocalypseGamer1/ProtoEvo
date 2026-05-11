@@ -29,6 +29,14 @@ public abstract class Cell implements Serializable, Coloured, Spawnable {
 
 	private Particle particle;
 	private Environment environment;
+	// Phylogeny: each cell carries a lineage tag inherited from its parent
+	// (or assigned new at initial spawn for "founder" lineages). Combined
+	// with parentId, we can build a full ancestry tree without snapshotting
+	// every cell — most lineages die out within a few generations, only a
+	// few "successful" founders accumulate descendants. Default 0 means
+	// "uninitialised"; assigned on first creation through Environment.
+	private long lineageId = 0L;
+	private long parentId = 0L;
 	private final Colour healthyColour = new Colour(Color.WHITE);
 	private final Colour fullyDegradedColour = new Colour(Color.WHITE);
 	private final Colour currentColour = new Colour();
@@ -208,6 +216,28 @@ public abstract class Cell implements Serializable, Coloured, Spawnable {
 		for (ComplexMolecule molecule : availableComplexMolecules.keySet()) {
 			depleteComplexMolecule(molecule, delta * Environment.settings.cell.complexMoleculeDecayRate.get());
 		}
+
+		applyStarvationDamage(delta);
+	}
+
+	/**
+	 * Damage health when energy is below the starvation threshold. Without
+	 * this, the energyDecayRate lever (the homeostat's main starvation knob)
+	 * has no death pathway — cells just stop growing at 0 energy and live
+	 * forever, so the population could only drop via spike damage or void
+	 * deaths. Adding this gives the homeostat real authority and makes
+	 * "food is scarce" a survivable challenge rather than a free pass.
+	 */
+	private void applyStarvationDamage(float delta) {
+		float cap = getAvailableEnergyCap();
+		if (cap <= 0f)
+			return;
+		float threshold = Environment.settings.cell.starvationThresholdFraction.get() * cap;
+		if (energyAvailable >= threshold)
+			return;
+		float deficit = 1f - (energyAvailable / threshold);   // 0..1
+		float rate = Environment.settings.cell.starvationDeathRate.get();
+		damage(delta * deficit * rate, CauseOfDeath.STARVATION);
 	}
 
 	public void voidDamage(float delta) {
@@ -372,9 +402,20 @@ public abstract class Cell implements Serializable, Coloured, Spawnable {
 	}
 
 	public void addFood(Food.Type foodType, float amount) {
-		Food food = foodToDigest.getOrDefault(foodType, new Food(amount, foodType));
-		food.addSimpleMass(amount);
-		foodToDigest.put(foodType, food);
+		// Same double-mass bug as the old Cell.eat had: fresh Food gets
+		// mass=amount via the constructor, then addSimpleMass(amount) ran
+		// unconditionally — every chemical-drip absorption was actually 2×
+		// the intended yield. Combined with chemical drip being an unsourced
+		// mass spring (plants don't lose mass when their chemicals are
+		// extracted), this let large protozoa populations sustain on tiny
+		// plant counts.
+		Food food = foodToDigest.get(foodType);
+		if (food == null) {
+			food = new Food(amount, foodType);
+			foodToDigest.put(foodType, food);
+		} else {
+			food.addSimpleMass(amount);
+		}
 	}
 
 	public void digest(float delta) {
@@ -678,6 +719,9 @@ public abstract class Cell implements Serializable, Coloured, Spawnable {
 
 		stats.putBoolean("Being Engulfed", engulfer != null);
 
+		if (lineageId != 0L)
+			stats.putCount("Lineage ID", (int) lineageId);
+
 		stats.putPercentage("Light Level", 100f * getLightAtCell());
 		stats.putTemperature("Temperature (Internal)", temperature);
 		stats.putTemperature("Temperature (External)", getExternalTemperature());
@@ -777,6 +821,11 @@ public abstract class Cell implements Serializable, Coloured, Spawnable {
 	public void setGeneration(int generation) {
 		this.generation = generation;
 	}
+
+	public long getLineageId() { return lineageId; }
+	public void setLineageId(long id) { this.lineageId = id; }
+	public long getParentId() { return parentId; }
+	public void setParentId(long id) { this.parentId = id; }
 
 	public int burstMultiplier() {
 		return 1;

@@ -15,20 +15,45 @@ public class CellSettings extends Settings {
             // starved before any NN evolution could improve foraging.
             .025f
     );
-    // Bumped from 1e-3/1e-4. Newborn protozoa are below the 2×minRadius
-    // threshold for engulfing other cells, so their only food source is the
-    // chemical-drip absorption near plants. With my Cell.eat fix removing the
-    // double-mass bug AND with cells defaulting smaller starting energy, the
-    // old 1e-3 conversion rate didn't deliver enough mass for new cells to
-    // grow up to engulf size before starving. 5× bump bootstraps them.
+    // Starvation damage: when a cell's energy falls below
+    // `starvationThresholdFraction` × its energy cap, it begins to lose
+    // health at `starvationDeathRate` × the deficit fraction per sim second.
+    // Without this, an energy-depleted cell just stops growing and repairing
+    // but never dies — so the homeostat's "decay rate" lever couldn't
+    // actually reduce the population, no matter how high it pushed decay.
+    // Cells could indefinitely recycle each other via meat without ever
+    // hitting an energy-driven death pathway.
+    //
+    // Threshold is 5% of capacity — newborns spawn at 10% (startingEnergy=50,
+    // cap=500) so they have a small buffer before starvation begins. Death
+    // rate of 0.2/s means a fully-starved cell dies in ~5 sim seconds, fast
+    // enough that the homeostat's decay-rate lever has real authority over
+    // an out-of-target population.
+    public final Parameter<Float> starvationThresholdFraction = new Parameter<>(
+            "Starvation Threshold Fraction",
+            "Energy/capacity ratio below which cells start losing health to starvation.",
+            0.05f
+    );
+    public final Parameter<Float> starvationDeathRate = new Parameter<>(
+            "Starvation Death Rate",
+            "Health lost per second of fully-starved time (linearly scaled by deficit).",
+            0.2f
+    );
+    // Returned to the original 1e-3/1e-4. The earlier 5× bump was meant to
+    // help newborns bootstrap to engulf size, but it turned chemical-drip
+    // absorption into an unbounded free-mass source: plants don't lose mass
+    // when their chemicals are extracted, so drip income is decoupled from
+    // plant population. Newborns now bootstrap via the default-engulf fix
+    // in PhagocyticReceptor (input > -0.25 instead of > 0) which lets even
+    // tiny cells eat the moment they touch a plant.
     public final Parameter<Float> chemicalExtractionPlantConversion = new Parameter<>(
             "Chemical Extraction Plant Conversion",
             "The amount of food extracted from plant matter in the chemical solution.",
-            5e-3f);
+            1e-3f);
     public final Parameter<Float> chemicalExtractionMeatConversion = new Parameter<>(
             "Chemical Extraction Meat Conversion",
             "The amount of food extracted from meat matter in the chemical solution.",
-            5e-4f);
+            1e-4f);
     public final Parameter<Float> chemicalExtractionFactor = new Parameter<>(
             "Chemical Extraction Factor",
             "The amount to dilute the chemical solution by when extracting food.",

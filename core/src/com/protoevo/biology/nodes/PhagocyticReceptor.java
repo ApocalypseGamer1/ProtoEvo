@@ -117,6 +117,11 @@ public class PhagocyticReceptor extends NodeAttachment implements Serializable {
             return false;
         if (other instanceof MeatCell && !engulfMeat)
             return false;
+        // Adhered partners are off-limits — otherwise protozoa that evolved
+        // both adhesion and phagocytosis would eat their own colony, killing
+        // multicellular cooperation as an evolutionarily reachable strategy.
+        if (node.getCell().isAttachedTo(other))
+            return false;
         return other.isEdible()
                 && correctSizes(other) && notEngulfed(other)
                 && closeEnough(other) && roomFor(other);
@@ -133,8 +138,18 @@ public class PhagocyticReceptor extends NodeAttachment implements Serializable {
     private boolean correctSizes(Cell other) {
         Cell cell = node.getCell();
         float progressFactor = 0.5f + 0.5f * getConstructionProgress();
-        return other.getRadius() < progressFactor * cell.getRadius() * 0.8f
-                && cell.getRadius() > 2 * Environment.settings.minParticleRadius.get();
+        // Was: prey radius < 0.8 × cell radius × progressFactor. That meant
+        // prey had to be substantially smaller than the predator — a cell
+        // touching a plant the same size as itself couldn't eat it. Bumped
+        // to 1.2× so cells can engulf prey up to ~20% larger; combined with
+        // roomFor's area gate this still prevents nonsensical "minnow eats
+        // whale" scenarios.
+        // Also dropped the 2×minRadius lower bound on the predator: with
+        // the default-engulf semantics there's no reason to forbid small
+        // cells from trying — they'll fail roomFor naturally if the prey
+        // doesn't fit.
+        return other.getRadius() < progressFactor * cell.getRadius() * 1.2f
+                && cell.getRadius() > Environment.settings.minParticleRadius.get();
     }
 
     private boolean notEngulfed(Cell other) {
@@ -142,9 +157,20 @@ public class PhagocyticReceptor extends NodeAttachment implements Serializable {
     }
 
     private boolean closeEnough(Cell other) {
+        // Was: distance from THIS NODE'S world position. That meant a cell
+        // touching prey on its left side wouldn't engulf if its receptor
+        // node was angled toward the right — even though physically in
+        // contact. Now we accept either: the node is close enough OR the
+        // cells are physically in contact (centers within sum of radii +
+        // engulfRange). This matches the user-visible expectation: "if my
+        // cell is touching food, it should eat."
+        Cell cell = node.getCell();
+        float r = engulfRange();
         Vector2 nodePos = node.getWorldPosition();
-        float d = other.getRadius() + engulfRange();
-        return nodePos.dst2(other.getPos()) < d*d;
+        float dNode = other.getRadius() + r;
+        if (nodePos.dst2(other.getPos()) < dNode*dNode) return true;
+        float dCenter = cell.getRadius() + other.getRadius() + r * 0.5f;
+        return cell.getPos().dst2(other.getPos()) < dCenter*dCenter;
     }
 
     public float engulfRange() {

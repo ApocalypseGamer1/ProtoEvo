@@ -241,6 +241,252 @@ public class SimulationScreen extends ScreenAdapter {
         return (EnvironmentRenderer) environmentRenderer.getBaseRenderer();
     }
 
+    // ===== Lineage tree overlay =====
+    // Phylogenetic tree restricted to *currently-living* protozoa and their
+    // branch-point ancestors. Time on X (oldest branch point left, now
+    // right); each visible lineage is a coloured horizontal segment. Linear
+    // chains (parent → only-child → only-child …) are collapsed: the tree
+    // only shows actual divergence events plus living leaves, so the
+    // visible row count is bounded by living population × branchiness
+    // rather than total cells ever born.
+    private boolean lineageOverlay = false;
+    private com.badlogic.gdx.graphics.glutils.ShapeRenderer lineageShape;
+    private static final int LINEAGE_MAX_VISIBLE_LEAVES = 80;
+    // Per-render scratch state.
+    private final HashSet<Long> lineageOnLivingPath = new HashSet<>();
+    private final HashMap<Long, ArrayList<com.protoevo.env.LineageRecord>> lineageLivingChildren =
+            new HashMap<>();
+    private final ArrayList<com.protoevo.env.LineageRecord> lineageVisibleRoots = new ArrayList<>();
+
+    public void toggleLineageOverlay() {
+        lineageOverlay = !lineageOverlay;
+        if (lineageOverlay && lineageShape == null)
+            lineageShape = new com.badlogic.gdx.graphics.glutils.ShapeRenderer();
+        System.out.println("Lineage tree: " + (lineageOverlay ? "ON" : "OFF"));
+    }
+    public boolean isLineageOverlay() { return lineageOverlay; }
+
+    private static void lineageColor(long id, com.badlogic.gdx.graphics.Color out) {
+        // Hashed → saturated colour. Stable per lineage so the eye can
+        // follow a branch across the tree.
+        float r = ((id * 2654435761L) >>> 0  & 0xff) / 255f;
+        float g = ((id * 40503L)        >>> 8  & 0xff) / 255f;
+        float b = ((id * 2246822519L)   >>> 16 & 0xff) / 255f;
+        float maxC = Math.max(r, Math.max(g, b));
+        if (maxC > 1e-3f) { r /= maxC; g /= maxC; b /= maxC; }
+        out.set(r, g, b, 0.95f);
+    }
+
+    private void rebuildLineageChildren(java.util.Map<Long, com.protoevo.env.LineageRecord> recs) {
+        lineageOnLivingPath.clear();
+        lineageLivingChildren.clear();
+        lineageVisibleRoots.clear();
+        // Walk from each currently-alive record up through its ancestors,
+        // marking every record on a path to a living leaf. We render only
+        // these. Dead branches (subtrees with no living leaves) are
+        // automatically excluded.
+        for (com.protoevo.env.LineageRecord r : recs.values()) {
+            if (!r.isAlive()) continue;
+            long id = r.id;
+            while (id != 0L) {
+                if (!lineageOnLivingPath.add(id)) break; // already marked
+                com.protoevo.env.LineageRecord step = recs.get(id);
+                if (step == null) break;
+                id = step.parentId;
+            }
+        }
+        // Build the parent → living-children map and find roots.
+        for (Long id : lineageOnLivingPath) {
+            com.protoevo.env.LineageRecord r = recs.get(id);
+            if (r == null) continue;
+            if (r.parentId == 0L || !lineageOnLivingPath.contains(r.parentId)) {
+                lineageVisibleRoots.add(r);
+            } else {
+                lineageLivingChildren.computeIfAbsent(r.parentId, k -> new ArrayList<>()).add(r);
+            }
+        }
+        for (ArrayList<com.protoevo.env.LineageRecord> kids : lineageLivingChildren.values())
+            kids.sort((a, b) -> Integer.compare(b.aliveDescendants, a.aliveDescendants));
+        lineageVisibleRoots.sort((a, b) -> Integer.compare(b.aliveDescendants, a.aliveDescendants));
+    }
+
+    /** Walk down single-child chains starting at r, returning the first
+     *  descendant that either branches (≥2 living children) or is a
+     *  living leaf. Used to collapse linear chains so the tree shows only
+     *  divergence events. */
+    private com.protoevo.env.LineageRecord collapseChain(com.protoevo.env.LineageRecord r) {
+        while (true) {
+            ArrayList<com.protoevo.env.LineageRecord> kids = lineageLivingChildren.get(r.id);
+            if (kids == null || kids.size() != 1) return r;
+            // Exactly one living child — chain continues. If r is dead and
+            // its single child is also internal, skip through.
+            r = kids.get(0);
+        }
+    }
+
+    private final com.badlogic.gdx.graphics.Color lineageColScratch = new com.badlogic.gdx.graphics.Color();
+
+    /**
+     * Draw `r` as a horizontal segment starting at chainStartTime (the
+     * birth time of the linear-chain's *first* ancestor that was the
+     * collapse-anchor), and at its branch point recurse into kids.
+     */
+    private void drawLineageSubtree(com.protoevo.env.LineageRecord r,
+                                    float chainStartTime,
+                                    float xLeft, float xRight,
+                                    float yTop, float yBottom,
+                                    float tStart, float tEnd) {
+        float tSpan = Math.max(1e-3f, tEnd - tStart);
+        float xStart = xLeft + ((chainStartTime - tStart) / tSpan) * (xRight - xLeft);
+        // For a living leaf, draw out to "now" (xRight). For a dead branch
+        // point, draw to its own deathTime — that's when its descendants
+        // diverged from a single common stem.
+        float xEnd = (r.isAlive() ? xRight
+                : xLeft + ((Math.max(r.deathTime, r.birthTime) - tStart) / tSpan)
+                        * (xRight - xLeft));
+        if (xStart < xLeft) xStart = xLeft;
+        if (xEnd > xRight) xEnd = xRight;
+        if (xEnd < xStart) xEnd = xStart;
+        float yMid = 0.5f * (yTop + yBottom);
+
+        lineageColor(r.id, lineageColScratch);
+        lineageShape.setColor(lineageColScratch);
+        // Thickness scales with descendant count (log) so dominant
+        // branches visually stand out.
+        float thickness = (float) Math.max(1.5, 1.5 + Math.log(1 + r.aliveDescendants));
+        lineageShape.rectLine(xStart, yMid, xEnd, yMid, thickness);
+
+        ArrayList<com.protoevo.env.LineageRecord> kids = lineageLivingChildren.get(r.id);
+        if (kids == null || kids.isEmpty()) return;
+
+        int totalKidDescendants = 0;
+        for (com.protoevo.env.LineageRecord k : kids) totalKidDescendants += k.aliveDescendants;
+        if (totalKidDescendants <= 0) return;
+
+        float yRange = yTop - yBottom;
+        float yCursor = yTop;
+        for (com.protoevo.env.LineageRecord k : kids) {
+            // Collapse chains: walk down single-child paths from k to its
+            // first divergence point or living leaf. The horizontal segment
+            // we draw for the chain runs from k.birthTime out to the
+            // resolved record's lifespan.
+            com.protoevo.env.LineageRecord collapsed = collapseChain(k);
+            float frac = collapsed.aliveDescendants / (float) totalKidDescendants;
+            float kSize = frac * yRange;
+            float kYTop = yCursor;
+            float kYBottom = yCursor - kSize;
+            float kYMid = 0.5f * (kYTop + kYBottom);
+            float kBirthX = xLeft + ((k.birthTime - tStart) / tSpan) * (xRight - xLeft);
+            if (kBirthX < xStart) kBirthX = xStart;
+            if (kBirthX > xRight) kBirthX = xRight;
+            // Vertical branch line at the divergence point.
+            lineageColor(collapsed.id, lineageColScratch);
+            lineageShape.setColor(lineageColScratch);
+            lineageShape.rectLine(kBirthX, yMid, kBirthX, kYMid, 1.5f);
+            drawLineageSubtree(collapsed, k.birthTime,
+                    xLeft, xRight, kYTop, kYBottom, tStart, tEnd);
+            yCursor = kYBottom;
+        }
+    }
+
+    private int countLivingLeaves(com.protoevo.env.LineageRecord r) {
+        ArrayList<com.protoevo.env.LineageRecord> kids = lineageLivingChildren.get(r.id);
+        if (kids == null || kids.isEmpty())
+            return r.isAlive() ? 1 : 0;
+        int n = 0;
+        for (com.protoevo.env.LineageRecord k : kids)
+            n += countLivingLeaves(collapseChain(k));
+        return n;
+    }
+
+    private void renderLineageOverlay() {
+        if (environment == null) return;
+        java.util.Map<Long, com.protoevo.env.LineageRecord> recs =
+                environment.getLineageRecords();
+        if (recs.isEmpty()) return;
+
+        rebuildLineageChildren(recs);
+        if (lineageVisibleRoots.isEmpty()) return;
+
+        // Count living leaves per root (post-chain-collapse) and pick the
+        // strongest roots that together fit in our visible-leaf budget.
+        // This keeps each row tall enough to actually see — at 80 leaves
+        // and ~500px tree height we still get ~6px per row.
+        int aliveCount = 0;
+        int rootsShown = 0;
+        ArrayList<com.protoevo.env.LineageRecord> roots = lineageVisibleRoots;
+        for (int i = 0; i < roots.size(); i++) {
+            com.protoevo.env.LineageRecord root = collapseChain(roots.get(i));
+            int leaves = countLivingLeaves(root);
+            if (leaves <= 0) continue;
+            if (aliveCount + leaves > LINEAGE_MAX_VISIBLE_LEAVES && rootsShown > 0)
+                break;
+            aliveCount += leaves;
+            rootsShown++;
+        }
+        if (rootsShown == 0) return;
+
+        // Time window — from oldest visible root's birth to now.
+        float now = environment.getElapsedTime();
+        float tStart = now;
+        int totalLeaves = 0;
+        for (int i = 0; i < rootsShown; i++) {
+            com.protoevo.env.LineageRecord root = collapseChain(roots.get(i));
+            if (root.birthTime < tStart) tStart = root.birthTime;
+            totalLeaves += countLivingLeaves(root);
+        }
+        if (totalLeaves <= 0) return;
+        float tEnd = now + Math.max(1f, (now - tStart) * 0.02f);
+
+        float w = Gdx.graphics.getWidth();
+        float h = Gdx.graphics.getHeight();
+        float panelW = w * 0.55f;
+        float panelH = h * 0.7f;
+        float panelX = w - panelW - 24f;
+        float panelY = h * 0.05f;
+
+        Gdx.gl.glEnable(com.badlogic.gdx.graphics.GL20.GL_BLEND);
+        lineageShape.setProjectionMatrix(uiBatch.getProjectionMatrix());
+        lineageShape.begin(com.badlogic.gdx.graphics.glutils.ShapeRenderer.ShapeType.Filled);
+        lineageShape.setColor(0f, 0f, 0f, 0.7f);
+        lineageShape.rect(panelX, panelY, panelW, panelH);
+
+        float padX = 14f, padY = 36f;
+        float treeLeft = panelX + padX;
+        float treeRight = panelX + panelW - padX;
+        float treeTop = panelY + panelH - padY;
+        float treeBottom = panelY + padY;
+        float yRange = treeTop - treeBottom;
+        float yCursor = treeTop;
+        for (int i = 0; i < rootsShown; i++) {
+            com.protoevo.env.LineageRecord root = collapseChain(roots.get(i));
+            int leaves = countLivingLeaves(root);
+            float frac = leaves / (float) totalLeaves;
+            float rSize = frac * yRange;
+            float rYTop = yCursor;
+            float rYBottom = yCursor - rSize;
+            drawLineageSubtree(root, root.birthTime,
+                    treeLeft, treeRight, rYTop, rYBottom, tStart, tEnd);
+            yCursor = rYBottom;
+        }
+        lineageShape.end();
+        Gdx.gl.glDisable(com.badlogic.gdx.graphics.GL20.GL_BLEND);
+
+        uiBatch.begin();
+        font.setColor(1f, 1f, 1f, 1f);
+        font.draw(uiBatch,
+                String.format("Phylogeny (currently alive)  %d/%d roots, %d leaves",
+                        rootsShown, lineageVisibleRoots.size(), totalLeaves),
+                panelX + 10f, panelY + panelH - 10f);
+        font.setColor(0.6f, 0.6f, 0.6f, 1f);
+        font.draw(uiBatch, String.format("t=%.0fs", tStart),
+                panelX + 10f, panelY + 22f);
+        font.draw(uiBatch, String.format("now: t=%.0fs", now),
+                panelX + panelW - 140f, panelY + 22f);
+        uiBatch.end();
+    }
+    // ===== end Lineage tree overlay =====
+
     // ===== Turbo mode =====
     // Black-screen fast-forward: skip all environment rendering, run sim updates
     // in a tight loop within each render frame, and draw a small line chart of
@@ -458,6 +704,9 @@ public class SimulationScreen extends ScreenAdapter {
             return;
 
         topBar.draw(delta);
+
+        if (lineageOverlay)
+            renderLineageOverlay();
 
         uiBatch.begin();
 

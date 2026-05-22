@@ -81,6 +81,19 @@ public class MiscSettings extends Settings {
             0.1f
     );
 
+    // Which physics engine drives the sim. Box2D is single-threaded; Jolt is
+    // multi-threaded but the port is still under construction (sessions 2-3).
+    // Stay on "box2d" until the Jolt port has reached behavioural parity.
+    //   "box2d" — original libGDX Box2D wrapper. Stable, slow under 2000+ bodies.
+    //   "jolt"  — jolt-jni backend. Throws UnsupportedOperationException
+    //             on any sim tick until Session 2 lands. Use only for testing
+    //             the engine selector.
+    public final Parameter<String> physicsEngine = new Parameter<>(
+            "Physics Engine",
+            "Which physics backend to use: \"box2d\" or \"jolt\".",
+            "box2d"
+    );
+
 
     public MiscSettings() {
         super("Misc");

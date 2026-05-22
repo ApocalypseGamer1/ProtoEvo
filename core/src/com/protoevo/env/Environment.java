@@ -16,6 +16,7 @@ import com.protoevo.core.Statistics;
 import com.protoevo.maths.Shape;
 import com.protoevo.physics.*;
 import com.protoevo.physics.box2d.Box2DPhysics;
+import com.protoevo.physics.jolt.JoltPhysics;
 import com.protoevo.settings.SimulationSettings;
 import com.protoevo.maths.Geometry;
 import com.protoevo.utils.SerializableFunction;
@@ -108,7 +109,17 @@ public class Environment implements Serializable
 
 		hasStarted = false;
 		createTransientObjects();
-		physics = new Box2DPhysics();
+		// Pick the physics backend by the misc.physicsEngine setting. Box2D
+		// is the default and the only one that's fully implemented today.
+		// "jolt" selects the in-progress jolt-jni backend — calling its
+		// stepPhysics throws until Session 2 of the port lands.
+		String engine = settings.misc.physicsEngine.get();
+		if ("jolt".equalsIgnoreCase(engine)) {
+			System.out.println("Using Jolt physics backend (in-progress port).");
+			physics = new JoltPhysics();
+		} else {
+			physics = new Box2DPhysics();
+		}
 
 		System.out.println("Creating chemicals solution... ");
 		if (Environment.settings.enableChemicalField.get()) {

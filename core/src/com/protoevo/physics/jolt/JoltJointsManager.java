@@ -26,14 +26,26 @@ public class JoltJointsManager extends JointsManager {
     public static long serialVersionUID = 1L;
 
     /** Spring stiffness for the distance constraint. Larger = stiffer joint.
-     *  Empirically tuned to match Box2D's distance-joint default behaviour
-     *  at the scales we use in this sim. */
-    private static final float SPRING_K = 80f;
+     *  Bumped from 80 → 600 after observing visual drift: cells joined by
+     *  adhesion were pulling apart on screen because the spring wasn't
+     *  strong enough to overcome fluid drag + cilia thrust. At 600 the
+     *  joint behaves like a rigid-ish tether — cells follow each other
+     *  closely without locking position. */
+    private static final float SPRING_K = 600f;
 
     /** Damping coefficient applied to the relative velocity along the
      *  joint axis. Without this, particles oscillate around the rest
-     *  length indefinitely. */
-    private static final float DAMP_K = 4f;
+     *  length indefinitely. Scaled up alongside SPRING_K so the joint
+     *  remains critically-damped-ish. */
+    private static final float DAMP_K = 30f;
+
+    /** Multiplier on idealLength above which the joint is automatically
+     *  broken. Box2D's distance joint had a similar "max length" concept
+     *  and Cell.detachCellCondition reads getMaxLength() — but that only
+     *  fires every ~0.1 sim-sec, leaving a window where the spring is
+     *  too weak to hold the joint and the visual stretches arbitrarily.
+     *  Breaking eagerly in the constraint pass closes that window. */
+    private static final float BREAK_LENGTH_MULT = 2.0f;
 
     /** Reusable scratch vectors for constraint math. JointsManager runs
      *  sequentially so single instances are safe. */
@@ -92,6 +104,15 @@ public class JoltJointsManager extends JointsManager {
             dist = 1f;
         }
         float idealLen = joining.getIdealLength();
+
+        // Eager break: if a joint is stretched well past its ideal length,
+        // drop it now rather than applying a spring impulse that's probably
+        // too weak to recover and would otherwise show as a long stringy
+        // visual until the slower Cell.detachCellCondition tick (~0.1 s).
+        if (dist > idealLen * BREAK_LENGTH_MULT) {
+            jointRemovalRequests.add(joining.id);
+            return;
+        }
 
         // Different constraint behaviour by joint type.
         Joining.MetaData meta = joining.getMetaData();

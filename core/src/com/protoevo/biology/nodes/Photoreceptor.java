@@ -7,7 +7,7 @@ import com.protoevo.env.Environment;
 import com.protoevo.maths.Functions;
 import com.protoevo.physics.Coloured;
 import com.protoevo.maths.Shape;
-import com.protoevo.physics.box2d.Box2DParticle;
+// Box2DParticle import removed — now uses abstract Particle.
 import com.protoevo.utils.Colour;
 
 
@@ -142,8 +142,11 @@ public class Photoreceptor extends NodeAttachment implements Serializable {
     }
 
 	public boolean cullFromRayCasting(Shape o) {
-		if (o instanceof Box2DParticle) {
-			Vector2 otherPos = ((Box2DParticle) o).getPos();
+		// Was: instanceof Box2DParticle. Switched to the abstract Particle
+		// so JoltParticle works too. The cast was a leak from when Box2D
+		// was the only physics backend.
+		if (o instanceof com.protoevo.physics.Particle) {
+			Vector2 otherPos = ((com.protoevo.physics.Particle) o).getPos();
             Vector2 myPos = node.getCell().getPos();
 			Vector2 dx = tmp.set(otherPos).sub(myPos).nor();
             Vector2 dir = tmp2.set(attachmentRelPos).add(myPos).nor();

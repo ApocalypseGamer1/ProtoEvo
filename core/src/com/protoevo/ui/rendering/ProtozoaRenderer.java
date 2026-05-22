@@ -14,7 +14,7 @@ import com.protoevo.biology.nodes.*;
 import com.protoevo.env.Environment;
 import com.protoevo.env.Rock;
 import com.protoevo.maths.Functions;
-import com.protoevo.physics.box2d.Box2DParticle;
+import com.protoevo.physics.Particle;
 import com.protoevo.ui.GraphicsAdapter;
 import com.protoevo.maths.Geometry;
 
@@ -221,8 +221,10 @@ public class ProtozoaRenderer {
 
         sr.setColor(1, 0, 1, 1);
         for (Object obj : protozoan.getInteractionQueue()) {
-            if (obj instanceof Box2DParticle) {
-                Box2DParticle particle = (Box2DParticle) obj;
+            // Was: instanceof Box2DParticle. Switched to abstract Particle
+            // so JoltParticle renders too.
+            if (obj instanceof Particle) {
+                Particle particle = (Particle) obj;
                 sr.circle(particle.getPos().x,
                           particle.getPos().y,
                           particle.getRadius() * 1.1f, 15);

@@ -55,10 +55,12 @@ public class EnvironmentRenderer implements Renderer {
     private final LightRenderer lightRenderer;
     private final Vector2 tmpVec = new Vector2();
     private final Color tmpColor = new Color();
-    // Runtime perf toggles. Default-on to preserve original look; flip via
-    // SimulationInputManager (F10/F11 hotkeys, top-bar button).
-    private boolean renderChemicals = true;
-    private boolean renderShadows = true;
+    // Runtime perf toggles. Default OFF (low-detail mode) so a fresh launch
+    // is at high FPS out of the box — sustained sim runs care more about
+    // throughput than visual fidelity. F10 toggles both back on if you
+    // want the prettier render. F11 toggles chemicals only.
+    private boolean renderChemicals = false;
+    private boolean renderShadows = false;
 
     public boolean isRenderChemicals() { return renderChemicals; }
     public void setRenderChemicals(boolean v) { renderChemicals = v; }

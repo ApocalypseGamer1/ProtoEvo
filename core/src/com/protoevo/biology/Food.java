@@ -140,10 +140,25 @@ public class Food implements Serializable {
     }
 
     public void decay(float delta) {
-        float decay = Math.max(0, 1f - getDecayRate() * delta);
-        mass = Math.max(0, mass - decay);
-        energy = Math.max(0, energy - decay);
-        complexMoleculeMasses.replaceAll((m, v) -> complexMoleculeMasses.get(m)
-                * Environment.settings.cell.complexMoleculeDecayRate.get());
+        // Geometric decay: each tick retain (1 - rate * delta) of mass and
+        // energy. Previous formula subtracted `1 - rate*delta` (which is ≈1)
+        // from mass and energy every tick — for plantDecayRate=1e-4 and
+        // delta=1e-3, the subtracted amount was ≈0.9999999, so food.mass
+        // and food.energy were zeroed within ONE tick of being created.
+        // That made the foodToDigest pool effectively non-functional:
+        // eat() added a tiny extraction per tick, decay zeroed it, digest()
+        // saw a near-empty food chunk, and cells appeared to get nothing
+        // from eating plants (energy fell, construction mass stayed at 0).
+        //
+        // The complex-molecule pass was also broken — it multiplied each
+        // value by `complexMoleculeDecayRate` (a tiny constant, 1e-6) every
+        // tick, instantly annihilating any stored complex molecules instead
+        // of decaying them at a per-second rate.
+        float retain = Math.max(0f, 1f - getDecayRate() * delta);
+        mass *= retain;
+        energy *= retain;
+        float molRetain = Math.max(0f,
+                1f - Environment.settings.cell.complexMoleculeDecayRate.get() * delta);
+        complexMoleculeMasses.replaceAll((m, v) -> v * molRetain);
     }
 }

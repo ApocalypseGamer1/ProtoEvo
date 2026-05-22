@@ -59,7 +59,7 @@ public class SimulationScreen extends ScreenAdapter {
     private Environment environment;
     private final SimulationInputManager inputManager;
     private final ShaderLayers environmentRenderer;
-    private final VignetteLayer vignetteLayer;
+    private VignetteLayer vignetteLayer;
     private final SpriteBatch uiBatch;
     private final Stage stage;
     private final GlyphLayout layout = new GlyphLayout();
@@ -142,11 +142,11 @@ public class SimulationScreen extends ScreenAdapter {
 
         inputManager = new SimulationInputManager(this);
         brightnessLayer = new BrightnessLayer(camera);
-        vignetteLayer = new VignetteLayer(camera, inputManager.getParticleTracker());
+//        vignetteLayer = new VignetteLayer(camera, inputManager.getParticleTracker());
         environmentRenderer = new ShaderLayers(
                 new EnvironmentRenderer(camera, simulation.getEnv(), inputManager),
                 new ShockWaveLayer(camera),
-                vignetteLayer,
+               // vignetteLayer,
                 brightnessLayer
         );
 
@@ -542,8 +542,37 @@ public class SimulationScreen extends ScreenAdapter {
                 && Math.abs(proto - turboLastLoggedProto) >= 0.25 * turboLastLoggedProto;
         if (turboLastLogMs == 0 || dueByTime || dueByChange) {
             int plants = environment.getCount(com.protoevo.biology.cells.PlantCell.class);
-            System.out.printf("[TURBO] sim=%.1fs  protozoa=%d  plants=%d%n",
-                    environment.getElapsedTime(), proto, plants);
+            // Diagnostic: average protozoan energy / construction-mass /
+            // food-mass so we can see at a glance whether eating delivers
+            // anything. If avgFoodMass > 0 but avgConstrMass stays at 0,
+            // digest isn't converting. If avgFoodMass is also 0, the eat
+            // path isn't filling the food pool. If construction-mass cap
+            // is full but cells aren't growing/splitting, the bottleneck
+            // is elsewhere.
+            double sumE = 0, sumCM = 0, sumFood = 0, sumR = 0, sumAge = 0;
+            int n = 0, engulfing = 0;
+            for (com.protoevo.biology.cells.Cell c : environment.getCells()) {
+                if (!(c instanceof com.protoevo.biology.cells.Protozoan)) continue;
+                com.protoevo.biology.cells.Protozoan p = (com.protoevo.biology.cells.Protozoan) c;
+                if (p.isDead()) continue;
+                sumE += p.getEnergyAvailable();
+                sumCM += p.getConstructionMassAvailable();
+                for (com.protoevo.biology.Food f : p.getFoodToDigest().values())
+                    sumFood += f.getSimpleMass();
+                sumR += p.getRadius();
+                sumAge += p.getTimeAlive();
+                if (!p.getEngulfedCells().isEmpty()) engulfing++;
+                n++;
+            }
+            if (n > 0) {
+                System.out.printf("[TURBO] sim=%.1fs  protozoa=%d  plants=%d  "
+                        + "avgE=%.1f  avgCM=%.5g  avgFood=%.5g  avgR=%.4f  avgAge=%.1fs  engulfing=%d%n",
+                        environment.getElapsedTime(), proto, plants,
+                        sumE / n, sumCM / n, sumFood / n, sumR / n, sumAge / n, engulfing);
+            } else {
+                System.out.printf("[TURBO] sim=%.1fs  protozoa=%d  plants=%d  (no live protozoa)%n",
+                        environment.getElapsedTime(), proto, plants);
+            }
             turboLastLogMs = now;
             turboLastLoggedProto = proto;
         }
@@ -726,6 +755,8 @@ public class SimulationScreen extends ScreenAdapter {
         if (DebugMode.isDebugMode())
             drawDebugInfo();
 
+        drawSignatureHud();
+
         uiBatch.end();
 
         stage.setDebugAll(DebugMode.isModeOrHigher(DebugMode.SIMPLE_INFO));
@@ -751,6 +782,206 @@ public class SimulationScreen extends ScreenAdapter {
 
         float x = 3 * font.getLineHeight();
         font.draw(uiBatch, textWithDots.toString(), x, x);
+    }
+
+    // BLAST-style signature HUD with directional, semantic pairing. Plants
+    // have 1 surface signature; protozoa have 3 (plant-receptor key,
+    // receiving receptor = identity, phagocytic receptor = what they hunt).
+    // For two-cell comparison we don't pair by length — we pair by what's
+    // ecologically meaningful:
+    //   * A.phagocytic ↔ B.receiving  ("Can A eat B?")
+    //   * A.receiving ↔ B.phagocytic  ("Can B eat A?")
+    //   * A.plantKey  ↔ B.plantKey    ("Diet overlap")
+    // Mixed types (protozoa↔plant) compare the protozoa's plant-receptor
+    // key to the plant's surface signature.
+    private void drawSignatureHud() {
+        com.protoevo.physics.Particle tracked =
+                inputManager.getParticleTracker().getTrackedParticle();
+        if (tracked == null) return;
+        com.protoevo.physics.Particle compared =
+                inputManager.getParticleTracker().getComparedParticle();
+
+        float h = font.getLineHeight();
+        float x = h;
+        float y = h * 1.2f;  // anchor at bottom, grow upward
+
+        if (compared == null) {
+            // Single-cell view: list every sequence with its label.
+            java.util.List<String[]> rows = signatureRowsFor(tracked);
+            if (rows.isEmpty()) return;
+            for (int i = rows.size() - 1; i >= 0; i--) {
+                String[] row = rows.get(i);
+                font.draw(uiBatch, row[0] + ":  " + row[1], x, y);
+                y += h;
+            }
+            font.draw(uiBatch,
+                    "[ shift+click another cell to BLAST-compare ]", x, y);
+            return;
+        }
+
+        // Two-cell view: build the semantic pair list, iterate bottom-up.
+        java.util.List<Pair> pairs = buildBlastPairs(tracked, compared);
+        if (pairs.isEmpty()) return;
+        for (int i = pairs.size() - 1; i >= 0; i--) {
+            Pair p = pairs.get(i);
+            if (p.b == null) {
+                // No counterpart in B — show A alone.
+                font.draw(uiBatch, p.aLabel + ":  " + p.a, x, y);
+                y += h;
+            } else {
+                // Align marker to where the residues start: 2 ("B ") +
+                // p.bLabel + 3 (":  ").
+                String prefix = spaces(2 + p.bLabel.length() + 3);
+                font.draw(uiBatch, "B " + p.bLabel + ":  " + p.b, x, y);
+                y += h;
+                font.draw(uiBatch,
+                        prefix + matchMarkerLine(p.a, p.b)
+                                + "   " + String.format("id %.0f%%  run %d",
+                                        100f * identityFraction(p.a, p.b),
+                                        longestContiguousMatchLen(p.a, p.b)),
+                        x, y);
+                y += h;
+                font.draw(uiBatch, "A " + p.aLabel + ":  " + p.a, x, y);
+                y += h;
+                // Tag line above the block: what does this pair *mean*?
+                font.draw(uiBatch, "  " + p.description, x, y);
+                y += h * 1.05f;
+            }
+        }
+        font.draw(uiBatch, "[ A = tracked, B = shift-clicked ]", x, y);
+    }
+
+    private static final class Pair {
+        final String aLabel, a, bLabel, b, description;
+        Pair(String aLabel, String a, String bLabel, String b, String description) {
+            this.aLabel = aLabel; this.a = a;
+            this.bLabel = bLabel; this.b = b;
+            this.description = description;
+        }
+    }
+
+    /** Build the semantic pair list for a two-cell HUD comparison.
+     *  Returns the pairs in the order they'll be rendered (top→bottom). */
+    private java.util.List<Pair> buildBlastPairs(
+            com.protoevo.physics.Particle ap, com.protoevo.physics.Particle bp) {
+        Object a = ap.getUserData();
+        Object b = bp.getUserData();
+        java.util.List<Pair> out = new java.util.ArrayList<>();
+
+        boolean ap1 = a instanceof com.protoevo.biology.cells.Protozoan;
+        boolean bp1 = b instanceof com.protoevo.biology.cells.Protozoan;
+        boolean apl = a instanceof com.protoevo.biology.cells.PlantCell;
+        boolean bpl = b instanceof com.protoevo.biology.cells.PlantCell;
+
+        if (ap1 && bp1) {
+            com.protoevo.biology.cells.Protozoan A = (com.protoevo.biology.cells.Protozoan) a;
+            com.protoevo.biology.cells.Protozoan B = (com.protoevo.biology.cells.Protozoan) b;
+            String aPhag = str(A.getProtozoaPhagocyticReceptor());
+            String aRecv = str(A.getProtozoaReceivingReceptor());
+            String aPlnt = str(A.getPlantReceptorKey());
+            String bPhag = str(B.getProtozoaPhagocyticReceptor());
+            String bRecv = str(B.getProtozoaReceivingReceptor());
+            String bPlnt = str(B.getPlantReceptorKey());
+            if (aPhag != null && bRecv != null)
+                out.add(new Pair("Phagocytic   (75)", aPhag,
+                                 "Receiving    (75)", bRecv, "Can A eat B?"));
+            if (aRecv != null && bPhag != null)
+                out.add(new Pair("Receiving    (75)", aRecv,
+                                 "Phagocytic   (75)", bPhag, "Can B eat A?"));
+            if (aPlnt != null && bPlnt != null)
+                out.add(new Pair("Plant Key    (50)", aPlnt,
+                                 "Plant Key    (50)", bPlnt, "Diet overlap"));
+        } else if (ap1 && bpl) {
+            com.protoevo.biology.cells.Protozoan A = (com.protoevo.biology.cells.Protozoan) a;
+            com.protoevo.biology.cells.PlantCell B = (com.protoevo.biology.cells.PlantCell) b;
+            String aPlnt = str(A.getPlantReceptorKey());
+            String bSurf = str(B.getSurfaceSignature());
+            if (aPlnt != null && bSurf != null)
+                out.add(new Pair("Plant Key    (50)", aPlnt,
+                                 "Plant Surface(50)", bSurf, "Can A eat this plant?"));
+        } else if (apl && bp1) {
+            com.protoevo.biology.cells.PlantCell A = (com.protoevo.biology.cells.PlantCell) a;
+            com.protoevo.biology.cells.Protozoan B = (com.protoevo.biology.cells.Protozoan) b;
+            String aSurf = str(A.getSurfaceSignature());
+            String bPlnt = str(B.getPlantReceptorKey());
+            if (aSurf != null && bPlnt != null)
+                out.add(new Pair("Plant Surface(50)", aSurf,
+                                 "Plant Key    (50)", bPlnt, "Can B eat this plant?"));
+        } else if (apl && bpl) {
+            com.protoevo.biology.cells.PlantCell A = (com.protoevo.biology.cells.PlantCell) a;
+            com.protoevo.biology.cells.PlantCell B = (com.protoevo.biology.cells.PlantCell) b;
+            String aSurf = str(A.getSurfaceSignature());
+            String bSurf = str(B.getSurfaceSignature());
+            if (aSurf != null && bSurf != null)
+                out.add(new Pair("Plant Surface(50)", aSurf,
+                                 "Plant Surface(50)", bSurf, "Surface similarity"));
+        }
+        return out;
+    }
+
+    private static String str(com.protoevo.biology.evolution.AminoAcidSequence s) {
+        return s == null ? null : s.toString();
+    }
+
+    /** Returns ordered (label, sequence) rows for whatever signatures the
+     *  cell carries. Used in single-cell view. */
+    private java.util.List<String[]> signatureRowsFor(com.protoevo.physics.Particle p) {
+        java.util.List<String[]> rows = new java.util.ArrayList<>();
+        Object data = p.getUserData();
+        if (data instanceof com.protoevo.biology.cells.PlantCell) {
+            com.protoevo.biology.evolution.AminoAcidSequence s =
+                    ((com.protoevo.biology.cells.PlantCell) data).getSurfaceSignature();
+            if (s != null) rows.add(new String[]{"Plant Surface (50)", s.toString()});
+        } else if (data instanceof com.protoevo.biology.cells.Protozoan) {
+            com.protoevo.biology.cells.Protozoan c =
+                    (com.protoevo.biology.cells.Protozoan) data;
+            com.protoevo.biology.evolution.AminoAcidSequence pk = c.getPlantReceptorKey();
+            com.protoevo.biology.evolution.AminoAcidSequence rr = c.getProtozoaReceivingReceptor();
+            com.protoevo.biology.evolution.AminoAcidSequence pr = c.getProtozoaPhagocyticReceptor();
+            if (pk != null) rows.add(new String[]{"Plant Receptor Key (50)", pk.toString()});
+            if (rr != null) rows.add(new String[]{"Receiving Receptor (75)", rr.toString()});
+            if (pr != null) rows.add(new String[]{"Phagocytic Receptor(75)", pr.toString()});
+        }
+        return rows;
+    }
+
+    private static String matchMarkerLine(String a, String b) {
+        int n = Math.min(a.length(), b.length());
+        StringBuilder sb = new StringBuilder(n);
+        for (int i = 0; i < n; i++)
+            sb.append(a.charAt(i) == b.charAt(i) ? '|' : '.');
+        return sb.toString();
+    }
+
+    private static String spaces(int n) {
+        char[] c = new char[n];
+        java.util.Arrays.fill(c, ' ');
+        return new String(c);
+    }
+
+    private static float identityFraction(String a, String b) {
+        int n = Math.min(a.length(), b.length());
+        if (n == 0) return 0f;
+        int match = 0;
+        for (int i = 0; i < n; i++) if (a.charAt(i) == b.charAt(i)) match++;
+        return (float) match / n;
+    }
+
+    /** Length of the longest run of consecutive identical residues. This
+     *  is what the engulf gate actually keys on, so it's more useful for
+     *  the user than overall identity %. */
+    private static int longestContiguousMatchLen(String a, String b) {
+        int n = Math.min(a.length(), b.length());
+        int best = 0, cur = 0;
+        for (int i = 0; i < n; i++) {
+            if (a.charAt(i) == b.charAt(i)) {
+                cur++;
+                if (cur > best) best = cur;
+            } else {
+                cur = 0;
+            }
+        }
+        return best;
     }
 
     public ImageButton createImageButton(String texturePath, float width, float height, EventListener listener) {
@@ -1058,7 +1289,7 @@ public class SimulationScreen extends ScreenAdapter {
 
     public void toggleUI() {
         uiHidden = !uiHidden;
-        vignetteLayer.setUiHidden(uiHidden);
+//        vignetteLayer.setUiHidden(uiHidden);
     }
 
     public boolean hasSimulationNotLoaded() {

@@ -131,7 +131,13 @@ public class Environment implements Serializable
 	}
 
 	public void createTransientObjects() {
-		cellsToAdd = new HashSet<>();
+		// Concurrent set — parallel cell.update() workers can call
+		// registerToAdd() (e.g. burst-children path). Plain HashSet under
+		// concurrent writes corrupts its internal hash table — silent
+		// lost adds, NPEs deep in HashMap, intermittent crashes at high
+		// population. ConcurrentHashMap-backed key set has the same
+		// semantics for our usage and is lock-free for reads.
+		cellsToAdd = java.util.concurrent.ConcurrentHashMap.newKeySet();
 		chunks = new Chunks();
 		chunks.initialise();
 		forceChunkRebuild();
@@ -225,31 +231,63 @@ public class Environment implements Serializable
 	{
 		hasStarted = true;
 		settings = mySettings;
+		// Watchdog: time each sub-step. If anything exceeds the threshold,
+		// log it so we can see what's stalling the sim when it feels
+		// frozen. Threshold is 500ms — at 60fps GUI mode, anything over
+		// ~16ms drops frames, but 500ms is the threshold where the user
+		// would actually perceive the sim as "stuck". Numbers add up to
+		// total per-step time so the user can see which subsystem is hot.
+		long t0 = System.nanoTime();
 		for (Cell cell : getCells())
 			cell.getParticle().physicsUpdate();
+		long t1 = System.nanoTime();
 
 		timeManager.update(physicsDelta);
 		light.update(physicsDelta);
+		long t2 = System.nanoTime();
 
-		// Apply environmental current as a per-cell force. Done before the
-		// Box2D step so the force is integrated into this step's motion.
-		// Single-threaded — the math is cheap (a handful of sin/cos per
-		// cell) and avoids the thread-local Vector2 dance you'd need for
-		// a parallelStream.
 		applyCurrents();
+		long t3 = System.nanoTime();
 
 		if (physicsDelta > 0f)
 			physics.step(physicsDelta);
+		long t4 = System.nanoTime();
 
   		handleCellUpdates(physicsDelta, plantsAndMeatThisStep);
+		long t5 = System.nanoTime();
+
 		handleBirthsAndDeaths();
+		long t6 = System.nanoTime();
+
 		updateChunkAllocations(physicsDelta);
 		pruneDeadLineages(physicsDelta);
+		long t7 = System.nanoTime();
 
 		physics.getJointsManager().flushJoints();
+		long t8 = System.nanoTime();
 
 		if (chemicalsDelta > 0f && Environment.settings.enableChemicalField.get()) {
 			chemicalSolution.update(chemicalsDelta);
+		}
+		long t9 = System.nanoTime();
+
+		long totalMs = (t9 - t0) / 1_000_000L;
+		if (totalMs > 500) {
+			System.out.printf(
+					"[watchdog] slow tick %dms  physUpd=%dms  light=%dms  currents=%dms  "
+					+ "physStep=%dms  cellUpd=%dms  births=%dms  chunks=%dms  joints=%dms  chem=%dms  "
+					+ "cells=%d%n",
+					totalMs,
+					(t1 - t0) / 1_000_000L,
+					(t2 - t1) / 1_000_000L,
+					(t3 - t2) / 1_000_000L,
+					(t4 - t3) / 1_000_000L,
+					(t5 - t4) / 1_000_000L,
+					(t6 - t5) / 1_000_000L,
+					(t7 - t6) / 1_000_000L,
+					(t8 - t7) / 1_000_000L,
+					(t9 - t8) / 1_000_000L,
+					cells.size());
 		}
 	}
 
@@ -278,11 +316,22 @@ public class Environment implements Serializable
 
 	private void handleBirthsAndDeaths() {
 		handledBurstRequests.clear();
+		// Per-tick cap on burst processing. With engulf efficiency at 1.0,
+		// the entire population can hit splitRadius+health threshold in
+		// the same tick — leading to 500 simultaneous bursts, each creating
+		// 2-6 children with Box2D body construction, particle init, GRN
+		// cloning, lineage walks, and chunk allocation. That single tick
+		// can take seconds in real time, and the user experiences it as a
+		// freeze. Cap at 64/tick: any extra requests just sit in the queue
+		// for next tick.
+		int burstBudget = 64;
 		for (Cell parent : burstRequests.keySet()) {
+			if (burstBudget <= 0) break;
 			BurstRequest<? extends Cell> burstRequest = burstRequests.get(parent);
 			if (hasBurstCapacity(parent, burstRequest.getCellType()) && burstRequest.canBurst()) {
 				burstRequest.burst();
 				handledBurstRequests.add(parent);
+				burstBudget--;
 			}
 		}
 		for (Cell parent : handledBurstRequests)
@@ -369,6 +418,32 @@ public class Environment implements Serializable
 
 		buildSpawners();
 
+		// Initial-viability seed.
+		//
+		//   initialPlantSig (50): every plant gets this; every protozoa's
+		//     plantReceptorKey is set to a copy → guaranteed full-rate
+		//     plant feeding from frame 1.
+		//
+		//   initialReceiving / initialPhagocytic (75 each): TWO INDEPENDENT
+		//     random sequences. Every protozoa gets these two as its
+		//     receiving and phagocytic receptors. Because they're
+		//     independent random 75-mers, expected identity ≈ 5% << the
+		//     15% engulf threshold → no cell can eat any other at t=0
+		//     (no kin cannibalism on a fresh world). Mutation will drift
+		//     lineages apart; predator-prey relationships only emerge
+		//     when some lineage's phagocytic happens to drift toward
+		//     another lineage's receiving — a real evolutionary event,
+		//     not a freebie.
+		com.protoevo.biology.evolution.AminoAcidSequence initialPlantSig =
+				new com.protoevo.biology.evolution.AminoAcidSequence(
+						com.protoevo.biology.evolution.PlantSignatureTrait.LENGTH);
+		com.protoevo.biology.evolution.AminoAcidSequence initialReceiving =
+				new com.protoevo.biology.evolution.AminoAcidSequence(
+						com.protoevo.biology.evolution.ProtozoaSignatureTrait.LENGTH);
+		com.protoevo.biology.evolution.AminoAcidSequence initialPhagocytic =
+				new com.protoevo.biology.evolution.AminoAcidSequence(
+						com.protoevo.biology.evolution.ProtozoaSignatureTrait.LENGTH);
+
 		int nPlants = Environment.settings.worldgen.numInitialPlantPellets.get();
 		nPlants = Math.min(nPlants, chunks.getGlobalCapacity(PlantCell.class));
 		System.out.println("Creating population of " + nPlants + " plants..." );
@@ -379,6 +454,10 @@ public class Environment implements Serializable
 				cell = Evolvable.createNew(PlantCell.class);
 			else
 				cell = new PlantCell();
+			// Override the randomized signature with the shared seed so all
+			// initial plants are recognizable by the seeded protozoa.
+			cell.setSurfaceSignature(
+					new com.protoevo.biology.evolution.AminoAcidSequence(initialPlantSig));
 			cell.setEnvironmentAndBuildPhysics(this);
 			findRandomPositionOrKillCell(cell);
 		}
@@ -389,6 +468,12 @@ public class Environment implements Serializable
 		loadingStatus = "Spawning Protozoa";
 		for (int i = 0; i < nProtozoa; i++) {
 			Protozoan p = Evolvable.createNew(Protozoan.class);
+			p.setPlantReceptorKey(
+					new com.protoevo.biology.evolution.AminoAcidSequence(initialPlantSig));
+			p.setProtozoaReceivingReceptor(
+					new com.protoevo.biology.evolution.AminoAcidSequence(initialReceiving));
+			p.setProtozoaPhagocyticReceptor(
+					new com.protoevo.biology.evolution.AminoAcidSequence(initialPhagocytic));
 			p.setEnvironmentAndBuildPhysics(this);
 			findRandomPositionOrKillCell(p);
 		}
@@ -509,7 +594,10 @@ public class Environment implements Serializable
 		// the renderer can prioritise lineages with the most living
 		// descendants without scanning the whole tree every frame.
 		long pid = r.parentId;
-		while (pid != 0L) {
+		// Same safety cap as recordDeath — a cycle in parentId would hang
+		// every birth path and lock the sim. 4096 is far past any real depth.
+		int hops = 0;
+		while (pid != 0L && hops++ < 4096) {
 			LineageRecord p = lineageRecords.get(pid);
 			if (p == null) break;
 			p.aliveDescendants++;
@@ -523,7 +611,13 @@ public class Environment implements Serializable
 		r.deathTime = timeManager.getTimeElapsed();
 		r.aliveDescendants--; // self
 		long pid = r.parentId;
-		while (pid != 0L) {
+		// Safety cap: if a parentId chain ever forms a cycle (shouldn't,
+		// but a corrupted save or simultaneous-lineage-id collision could
+		// in principle create one), this loop would hang the death path
+		// and stall the entire sim. 4096 generations is way past any
+		// realistic chain depth.
+		int hops = 0;
+		while (pid != 0L && hops++ < 4096) {
 			LineageRecord p = lineageRecords.get(pid);
 			if (p == null) break;
 			p.aliveDescendants--;
@@ -745,6 +839,52 @@ public class Environment implements Serializable
 
 	public int numberOfProtozoa() {
 		return getCount(Protozoan.class);
+	}
+
+	// Per-cause death counters since last reset. Used by the homeostat tick
+	// to print "what's killing cells this window".
+	//
+	// MUST be a thread-safe map: Cell.kill is called from inside the
+	// parallelStream cell-update pass, so recordDeath fires concurrently
+	// from worker threads. The previous HashMap.merge() was a freeze risk
+	// — concurrent merges into a non-thread-safe HashMap can spin in
+	// internal bucket traversal and lock up the worker pool, which is
+	// exactly what happens in turbo mode where deaths per wall-second
+	// spike. ConcurrentHashMap.merge() is lock-free per bucket.
+	//
+	// Transient because the counts are diagnostic, not save state.
+	private transient java.util.concurrent.ConcurrentHashMap<com.protoevo.biology.CauseOfDeath, Integer>
+			recentProtozoaDeaths = new java.util.concurrent.ConcurrentHashMap<>();
+	private transient java.util.concurrent.ConcurrentHashMap<com.protoevo.biology.CauseOfDeath, Integer>
+			recentPlantDeaths = new java.util.concurrent.ConcurrentHashMap<>();
+
+	public void recordDeath(Cell cell, com.protoevo.biology.CauseOfDeath cause) {
+		if (recentProtozoaDeaths == null) recentProtozoaDeaths = new java.util.concurrent.ConcurrentHashMap<>();
+		if (recentPlantDeaths == null)    recentPlantDeaths    = new java.util.concurrent.ConcurrentHashMap<>();
+		java.util.concurrent.ConcurrentHashMap<com.protoevo.biology.CauseOfDeath, Integer> target =
+				cell instanceof Protozoan ? recentProtozoaDeaths
+				: cell instanceof com.protoevo.biology.cells.PlantCell ? recentPlantDeaths
+				: null;
+		if (target != null)
+			target.merge(cause, 1, Integer::sum);
+	}
+
+	public java.util.Map<com.protoevo.biology.CauseOfDeath, Integer> drainProtozoaDeaths() {
+		java.util.Map<com.protoevo.biology.CauseOfDeath, Integer> snap =
+				recentProtozoaDeaths == null
+						? java.util.Collections.emptyMap()
+						: new java.util.HashMap<>(recentProtozoaDeaths);
+		if (recentProtozoaDeaths != null) recentProtozoaDeaths.clear();
+		return snap;
+	}
+
+	public java.util.Map<com.protoevo.biology.CauseOfDeath, Integer> drainPlantDeaths() {
+		java.util.Map<com.protoevo.biology.CauseOfDeath, Integer> snap =
+				recentPlantDeaths == null
+						? java.util.Collections.emptyMap()
+						: new java.util.HashMap<>(recentPlantDeaths);
+		if (recentPlantDeaths != null) recentPlantDeaths.clear();
+		return snap;
 	}
 
 	public long getGeneration() {

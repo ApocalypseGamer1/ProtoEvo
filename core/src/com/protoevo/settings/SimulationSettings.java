@@ -21,7 +21,10 @@ public class SimulationSettings extends Settings {
     public final Parameter<Boolean> finishOnProtozoaExtinction = new Parameter<>(
             "Finish on Extinction",
             "Whether to stop the simulation when all Protozoa go extinct.",
-            true
+            // Default false now: the homeostat auto-respawns 250 seeded
+            // protozoa when extinction is detected, so the sim can keep
+            // running unattended overnight.
+            false
     );
 //    public final Settings.Parameter<Boolean> repopOnProtozoaExtinction = new Settings.Parameter<>(
 //            "Repopulate on Extinction",

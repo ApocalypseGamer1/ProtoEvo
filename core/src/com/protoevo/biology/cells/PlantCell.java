@@ -3,9 +3,11 @@ package com.protoevo.biology.cells;
 import com.badlogic.gdx.math.MathUtils;
 import com.badlogic.gdx.math.Vector2;
 import com.protoevo.biology.CauseOfDeath;
+import com.protoevo.biology.evolution.AminoAcidSequence;
 import com.protoevo.biology.evolution.Evolvable;
 import com.protoevo.biology.evolution.EvolvableFloat;
 import com.protoevo.biology.evolution.EvolvableList;
+import com.protoevo.biology.evolution.EvolvableObject;
 import com.protoevo.biology.nodes.SurfaceNode;
 import com.protoevo.biology.organelles.Organelle;
 import com.protoevo.core.Statistics;
@@ -30,6 +32,8 @@ public class PlantCell extends EvolvableCell {
     private float maxRadius;
     private float photosynthesisRate = 0;
     private List<SurfaceNode> surfaceNodes = new ArrayList<>();
+    // Surface signature recognized by phagocytic receptors. Evolves point-by-point.
+    private AminoAcidSequence surfaceSignature;
     private static final Statistics.ComplexUnit photosynthesisUnit =
             new Statistics.ComplexUnit(Statistics.BaseUnit.ENERGY).divide(Statistics.BaseUnit.TIME);
     private final PlantSplitFn splitFn = new PlantSplitFn(this);
@@ -172,6 +176,21 @@ public class PlantCell extends EvolvableCell {
     @Override
     public List<SurfaceNode> getSurfaceNodes() {
         return surfaceNodes;
+    }
+
+    // Plant surface signature: 50-residue evolvable string that the
+    // phagocytic receptors on grazers have to match in order to engulf.
+    // Mutates per-character so a lineage drifts gradually instead of
+    // re-rolling, giving predators a hill to climb instead of a
+    // lottery ticket. See AminoAcidSequence / PlantSignatureTrait.
+    @EvolvableObject(name = "Surface Signature",
+                     traitClass = "com.protoevo.biology.evolution.PlantSignatureTrait")
+    public void setSurfaceSignature(AminoAcidSequence sig) {
+        this.surfaceSignature = sig;
+    }
+
+    public AminoAcidSequence getSurfaceSignature() {
+        return surfaceSignature;
     }
 
     // Plants don't translate. If evolution wires a Flagellum onto a plant,

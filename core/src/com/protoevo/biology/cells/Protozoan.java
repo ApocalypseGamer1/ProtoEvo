@@ -38,20 +38,25 @@ public class Protozoan extends EvolvableCell
 	// saves can omit them without losing meaningful state.
 	private transient float mateDesireSignal = 0f;
 	private transient float splitDesireSignal = 0f;
-	// Multi-layered memory. Six latch slots split across three temporal
-	// layers, each with its own blend rate α:
-	//   Fast    (α=0.7): tactical — last few ticks
-	//   Medium  (α=0.3): behavioural — last ~10 ticks
-	//   Slow    (α=0.05): strategic — minutes of sim time
-	// On write, the slot blends new ← (1−α)·old + α·input. This gives the
-	// NN a hierarchy of temporal scales: the same recurrent state can
-	// hold "what just happened" and "what's been true for ages" at the
-	// same time. Each layer's slots are wired as both ControlVariable
-	// (NN writes via setMemoryX) and GeneRegulator (NN reads via
-	// getMemoryX) so they appear automatically in the per-cell NN viz
-	// as named in/out neurons. Transient because the GRN refills them
-	// every tick; old saves can omit them without losing meaningful
-	// state.
+	// Multi-layered memory with NN-controlled write gates and read-only
+	// product slots. Three temporal layers (Fast/Med/Slow), each with
+	// 2 slots and per-slot blend rate α. On write, the slot updates:
+	//
+	//   gate    = clamp(setMemoryGate_*, 0, 1)   // NN-controlled
+	//   eff_α   = α · gate                       // gate scales blend rate
+	//   slot    = (1−eff_α)·slot + eff_α·input
+	//
+	// gate=0 means "don't write this tick" — turns the slot into a
+	// proper latch that remembers specific events instead of always
+	// smoothing recent inputs. That's the LSTM input-gate pattern.
+	//
+	// In addition to the 6 directly-writable slots, the NN reads two
+	// PRODUCT slots that are multiplicative compositions of pairs of
+	// regular slots. Additive NNs can't synthesize "A AND B"-type
+	// features without specifically-tuned activations; exposing the
+	// product gives evolution access to conjunctive sensing for free.
+	//
+	// All transient; the GRN refills them every tick.
 	private static final int MEMORY_SLOTS = 6;
 	private static final float[] MEMORY_ALPHA = {
 			0.7f, 0.7f,   // Fast 0, 1
@@ -59,6 +64,7 @@ public class Protozoan extends EvolvableCell
 			0.05f, 0.05f  // Slow 0, 1
 	};
 	private transient float[] memory;
+	private transient float[] memoryGate; // NN-controlled write gate per slot
 	private List<SurfaceNode> surfaceNodes;
 
 	private float damageRate = 0;
@@ -114,7 +120,14 @@ public class Protozoan extends EvolvableCell
 
 		for (Cell engulfedCell : engulfedCells) {
 			handleEngulfing(engulfedCell, delta);
-			eat(engulfedCell, Environment.settings.protozoa.engulfEatingRateMultiplier.get() * delta);
+			// Multiply by the receptor's signature-match efficiency that
+			// was stamped onto the prey at engulf time. Perfect match
+			// digests at full rate; a barely-passing match digests at
+			// ~5% (floored). This is what makes a well-matched receptor
+			// actually pay off in the arms race.
+			float rate = Environment.settings.protozoa.engulfEatingRateMultiplier.get()
+					* delta * engulfedCell.getEngulfEfficiency();
+			eat(engulfedCell, rate);
 		}
 		engulfedCells.removeIf(this::removeEngulfedCondition);
 
@@ -213,6 +226,121 @@ public class Protozoan extends EvolvableCell
 	public void setColour(Colour colour) {
 		setHealthyColour(colour);
 		setDegradedColour(degradeColour(colour, 0.3f));
+	}
+
+	// Three cell-level evolvable sequences, all applied to every phagocytic
+	// receptor this cell builds (so the cell as a whole has one "diet").
+	//
+	//   plantReceptorKey (50 chars):  matched against PlantCell.surfaceSignature.
+	//     Higher identity = faster plant digestion.
+	//
+	//   protozoaReceivingReceptor (75 chars): cell's IDENTITY. What predators
+	//     target when they try to eat this cell.
+	//
+	//   protozoaPhagocyticReceptor (75 chars): what THIS cell looks for in
+	//     prey protozoa. Matched against the prey's protozoaReceivingReceptor.
+	//
+	// Predation is ASYMMETRIC. A eats B iff A.phagocytic matches B.receiving.
+	// B eats A iff B.phagocytic matches A.receiving. The two are independent
+	// — predator status is directional.
+	//
+	// Critically: for a cell NOT to eat its own kin, the lineage must keep
+	// its own phagocytic ≠ its own receiving. A cell whose phag ≈ recv would
+	// match its siblings as prey AND be matched by its siblings as prey —
+	// the lineage cannibalizes itself and goes extinct. Selection thus
+	// drives phag ≠ recv. Net effect: lineages diverge into "I am X /
+	// I hunt Y" specializations where X and Y are different sequences.
+	private AminoAcidSequence plantReceptorKey;
+	private AminoAcidSequence protozoaReceivingReceptor;
+	private AminoAcidSequence protozoaPhagocyticReceptor;
+
+	@EvolvableObject(name="Plant Receptor Key",
+					 traitClass="com.protoevo.biology.evolution.PlantSignatureTrait")
+	public void setPlantReceptorKey(AminoAcidSequence key) {
+		this.plantReceptorKey = key;
+	}
+
+	@EvolvableObject(name="Receiving Receptor",
+					 traitClass="com.protoevo.biology.evolution.ProtozoaSignatureTrait")
+	public void setProtozoaReceivingReceptor(AminoAcidSequence key) {
+		this.protozoaReceivingReceptor = key;
+	}
+
+	@EvolvableObject(name="Phagocytic Receptor",
+					 traitClass="com.protoevo.biology.evolution.ProtozoaSignatureTrait")
+	public void setProtozoaPhagocyticReceptor(AminoAcidSequence key) {
+		this.protozoaPhagocyticReceptor = key;
+	}
+
+	public AminoAcidSequence getPlantReceptorKey()           { return plantReceptorKey; }
+	public AminoAcidSequence getProtozoaReceivingReceptor()  { return protozoaReceivingReceptor; }
+	public AminoAcidSequence getProtozoaPhagocyticReceptor() { return protozoaPhagocyticReceptor; }
+
+	// Contact-only signature-match sensors. The NN can only know about
+	// compatibility with a neighbour it's PHYSICALLY TOUCHING — same as
+	// real cells, which sense membrane proteins via direct contact rather
+	// than at a distance. Returns 0 if not in contact with anything of
+	// the relevant type. Evolved NNs can use these to:
+	//   - approach/stay near a high-match plant (more food per second)
+	//   - engulf-or-not when touching another protozoa (Prey Match)
+	//   - flee/retract when touching a predator (Predator Threat)
+
+	@GeneRegulator(name="Touch Plant Match", min=0, max=1)
+	public float getTouchPlantMatch() {
+		if (plantReceptorKey == null || getParticle() == null) return 0f;
+		float best = 0f;
+		for (Collision c : getParticle().getContacts()) {
+			Object o = c.getOther(getParticle());
+			if (!(o instanceof com.protoevo.physics.Particle)) continue;
+			Object u = ((com.protoevo.physics.Particle) o).getUserData();
+			if (u instanceof PlantCell) {
+				AminoAcidSequence sig = ((PlantCell) u).getSurfaceSignature();
+				if (sig != null) {
+					float m = plantReceptorKey.identityWith(sig);
+					if (m > best) best = m;
+				}
+			}
+		}
+		return best;
+	}
+
+	@GeneRegulator(name="Touch Prey Match", min=0, max=1)
+	public float getTouchPreyMatch() {
+		if (protozoaPhagocyticReceptor == null || getParticle() == null) return 0f;
+		float best = 0f;
+		for (Collision c : getParticle().getContacts()) {
+			Object o = c.getOther(getParticle());
+			if (!(o instanceof com.protoevo.physics.Particle)) continue;
+			Object u = ((com.protoevo.physics.Particle) o).getUserData();
+			if (u instanceof Protozoan && u != this) {
+				AminoAcidSequence sig = ((Protozoan) u).getProtozoaReceivingReceptor();
+				if (sig != null) {
+					float m = protozoaPhagocyticReceptor.identityWith(sig);
+					if (m > best) best = m;
+				}
+			}
+		}
+		return best;
+	}
+
+	@GeneRegulator(name="Touch Predator Threat", min=0, max=1)
+	public float getTouchPredatorThreat() {
+		if (protozoaReceivingReceptor == null || getParticle() == null) return 0f;
+		float best = 0f;
+		for (Collision c : getParticle().getContacts()) {
+			Object o = c.getOther(getParticle());
+			if (!(o instanceof com.protoevo.physics.Particle)) continue;
+			Object u = ((com.protoevo.physics.Particle) o).getUserData();
+			if (u instanceof Protozoan && u != this) {
+				AminoAcidSequence theirPhag =
+						((Protozoan) u).getProtozoaPhagocyticReceptor();
+				if (theirPhag != null) {
+					float m = theirPhag.identityWith(protozoaReceivingReceptor);
+					if (m > best) best = m;
+				}
+			}
+		}
+		return best;
 	}
 
 	@GeneRegulator(name="Plant to Digest")
@@ -329,13 +457,29 @@ public class Protozoan extends EvolvableCell
 		if (memory == null) memory = new float[MEMORY_SLOTS];
 		return memory;
 	}
-	/** Apply the layer-specific blend: slot = (1-α)·slot + α·input. */
+	private float[] memGates() {
+		if (memoryGate == null) {
+			memoryGate = new float[MEMORY_SLOTS];
+			// Default to 1.0 (always-write) so a freshly-spawned cell with
+			// no GRN influence yet still behaves like the old un-gated
+			// memory until evolution wires the gates up.
+			for (int i = 0; i < MEMORY_SLOTS; i++) memoryGate[i] = 1f;
+		}
+		return memoryGate;
+	}
+	/** Gated blend: slot = (1 - α·gate)·slot + α·gate·input.
+	 *  When gate ≈ 0 the slot doesn't update this tick (true latch);
+	 *  when gate ≈ 1 it blends at the layer's base α. */
 	private void writeMemory(int slot, float input) {
 		float[] m = mem();
-		float a = MEMORY_ALPHA[slot];
+		float gate = memGates()[slot];
+		if (gate < 0f) gate = 0f;
+		else if (gate > 1f) gate = 1f;
+		float a = MEMORY_ALPHA[slot] * gate;
 		m[slot] = (1f - a) * m[slot] + a * input;
 	}
 
+	// --- Direct slot writes (value the NN wants to commit if its gate fires) ---
 	@ControlVariable(name="Memory Fast 0", min=-1, max=1)
 	public void setMemoryFast0(float v) { writeMemory(0, v); }
 	@ControlVariable(name="Memory Fast 1", min=-1, max=1)
@@ -349,6 +493,21 @@ public class Protozoan extends EvolvableCell
 	@ControlVariable(name="Memory Slow 1", min=-1, max=1)
 	public void setMemorySlow1(float v) { writeMemory(5, v); }
 
+	// --- Per-slot write gates (LSTM-style "should I write this tick?") ---
+	@ControlVariable(name="Gate Fast 0", min=0, max=1)
+	public void setGateFast0(float v) { memGates()[0] = v; }
+	@ControlVariable(name="Gate Fast 1", min=0, max=1)
+	public void setGateFast1(float v) { memGates()[1] = v; }
+	@ControlVariable(name="Gate Med 0", min=0, max=1)
+	public void setGateMed0(float v) { memGates()[2] = v; }
+	@ControlVariable(name="Gate Med 1", min=0, max=1)
+	public void setGateMed1(float v) { memGates()[3] = v; }
+	@ControlVariable(name="Gate Slow 0", min=0, max=1)
+	public void setGateSlow0(float v) { memGates()[4] = v; }
+	@ControlVariable(name="Gate Slow 1", min=0, max=1)
+	public void setGateSlow1(float v) { memGates()[5] = v; }
+
+	// --- Direct slot reads ---
 	@GeneRegulator(name="Memory Fast 0", min=-1, max=1)
 	public float getMemoryFast0() { return mem()[0]; }
 	@GeneRegulator(name="Memory Fast 1", min=-1, max=1)
@@ -362,9 +521,24 @@ public class Protozoan extends EvolvableCell
 	@GeneRegulator(name="Memory Slow 1", min=-1, max=1)
 	public float getMemorySlow1() { return mem()[5]; }
 
+	// --- Read-only product slots: the multiplicative composition of two
+	//     memory slots from different temporal layers. Additive NNs can't
+	//     synthesize "A AND B"-type conjunctive features without
+	//     specifically-tuned activations on hidden neurons; exposing
+	//     the product gives evolution that operation directly.
+	//     Range is [-1, 1] × [-1, 1] = [-1, 1] so the regulator mapping
+	//     is correct without renormalising.
+	@GeneRegulator(name="Memory Fast×Slow", min=-1, max=1)
+	public float getMemoryFastSlow() { return mem()[0] * mem()[4]; }
+	@GeneRegulator(name="Memory Med×Med", min=-1, max=1)
+	public float getMemoryMedMed() { return mem()[2] * mem()[3]; }
+
 	/** Read-only view of the memory state, for UI inspection. */
 	public float[] getMemory() {
 		return mem();
+	}
+	public float[] getMemoryGates() {
+		return memGates();
 	}
 	// ===== end Memory state =====
 
@@ -606,14 +780,10 @@ public class Protozoan extends EvolvableCell
 	}
 
 	public void age(float delta) {
-		// The setting is called "starvationFactor" and described as the rate
-		// of damage WHEN NOT EATING, but the original code applied it every
-		// tick regardless of feeding state — so well-fed cells slowly bled
-		// health and eventually died of HEALTH_TOO_LOW even with full energy
-		// stores. That's the "dying even though they have a ton of energy"
-		// case. Now we honor the setting's documented meaning: only apply
-		// the damage when the cell is actually energy-starved (below 25% of
-		// its current capacity).
+		// 1. STARVATION damage: only when actually energy-starved (below 25%
+		//    of capacity). Without this guard the original code bled well-fed
+		//    cells to death on starvationFactor — the "dying with a ton of
+		//    energy" case.
 		float energyCap = getRadius()
 				* Environment.settings.cell.energyCapFactor.get();
 		if (energyCap <= 0f || getEnergyAvailable() < 0.25f * energyCap) {
@@ -621,11 +791,35 @@ public class Protozoan extends EvolvableCell
 					* Environment.settings.protozoa.starvationFactor.get();
 			damage(damageRate * delta, CauseOfDeath.OLD_AGE);
 		}
+
+		// 2. SENESCENCE damage: age-driven, applies regardless of energy.
+		//    Without this, a cell that maxed its radius and pinned its
+		//    energy near the cap had ZERO death pathway — growth stopped,
+		//    splits were blocked by health < minHealthToSplit, and the cell
+		//    just sat there. Users observed individuals alive for 2000+ sim
+		//    seconds doing nothing. Quadratic ramp past maxLifespan
+		//    guarantees no immortals: at 2× lifespan damage hits peak rate,
+		//    at 3× lifespan it's 4× peak — death is inevitable.
+		float maxLifespan = Environment.settings.protozoa.maxLifespan.get();
+		if (maxLifespan > 0f) {
+			float excess = (getTimeAlive() - maxLifespan) / maxLifespan;
+			if (excess > 0f) {
+				float rate = excess * excess
+						* Environment.settings.protozoa.senescenceDeathRate.get();
+				damage(rate * delta, CauseOfDeath.OLD_AGE);
+			}
+		}
 	}
 
 	@Override
 	public boolean isEdible() {
-		return false;
+		// Living protozoa are now edible — but only by phagocytic receptors
+		// whose protozoa-key matches this cell's surface signature closely
+		// enough to clear the 80% identity threshold. So in practice, a
+		// generalist receptor with random keys can't just gobble its
+		// neighbours: predation requires a specifically-evolved key that
+		// matches the prey lineage. See PhagocyticReceptor.engulfCondition.
+		return !isDead();
 	}
 
 	public boolean hasMated() {

@@ -275,7 +275,15 @@ public class Simulation implements Runnable
 	//     "active competition" the user wanted, with periods of grazing
 	//     stress alternating with growth windows.
 	private boolean homeostasisEnabled = true;
-	private int homeostasisTargetPop = 250;
+	// 250 → 500. Initial spawn cohort is 500 protozoa from worldgen. With
+	// target 250 the homeostat saw 100% over-target on the very first tick
+	// and cranked decay to ~3.7× — draining a typical cell's 250J starting
+	// energy in ~3 sim-seconds. The diagnostic showed the entire initial
+	// cohort dying from this artificial throttling, not from real ecology.
+	// Aligning target with the spawn size lets the new cohort settle
+	// without immediate hostile pressure; the natural selection-pressure
+	// ratchet still tightens the world over time.
+	private int homeostasisTargetPop = 500;
 	private int homeostasisTargetPlants = 1000;
 	private float homeostasisInterval = 5f; // sim-seconds between updates
 
@@ -317,11 +325,15 @@ public class Simulation implements Runnable
 	private static final float GAIN_PLANT_ED     = -0.85f;
 	private static final float GAIN_MEAT_ED      = -0.7f;
 	private static final float GAIN_START_E      = -0.5f;
-	// New lever: chemical extraction throttle. Plants saturate the chem
-	// field regardless of food yield per mass, so even when plantED is at
-	// 0.001× the drip still feeds protozoa hundreds of energy/sec — the
-	// drip volume itself must be cut to actually starve the population.
-	private static final float GAIN_CHEM_EXTRACT = -1.5f;
+	// Reduced from -1.5 to -0.4. A high-magnitude gain combined with the
+	// leaky integral was producing >1000× chemDrip multipliers at low pop,
+	// which let cells nibble-feed indefinitely without needing to match
+	// plant signatures — defeating the whole receptor system. With -0.4
+	// the lever's max swing is ~exp(0.4 × ~4) ≈ 5×, so the homeostat
+	// can still encourage feeding during a crash but can't turn drips
+	// into a primary food source. Engulf (where receptor match matters)
+	// is now the dominant feeding path.
+	private static final float GAIN_CHEM_EXTRACT = -0.4f;
 
 	private float pidIntegral = 0f;
 	private float pidLastError = Float.NaN;
@@ -358,7 +370,10 @@ public class Simulation implements Runnable
 
 	// Reference values: must match the in-Java defaults set in CellSettings /
 	// SimulationSettings. Multipliers are computed relative to these.
-	private static final float HOMEO_BASE_DECAY = 0.025f;
+	// Re-interpreted: this is now a FRACTIONAL coefficient applied to
+	// (radius/minR × energyAvailable) in Cell.decayResources, not a flat
+	// J/sec rate. Keep in sync with CellSettings.energyDecayRate default.
+	private static final float HOMEO_BASE_DECAY = 0.005f;
 	private static final float HOMEO_BASE_PLANT_ED = 2e5f;
 	private static final float HOMEO_BASE_MEAT_ED = 6e5f;
 	private static final float HOMEO_BASE_START_E = 50f;
@@ -379,12 +394,17 @@ public class Simulation implements Runnable
 		// Run the plant controller alongside the protozoa one — they target
 		// different populations with different levers, so they can't interfere.
 		plantHomeostasisTick();
+		// Ratchet the selection-pressure exponent up when conditions allow.
+		// Independent of the PID — only goes one direction.
+		maybeRatchetSelection();
 		int pop = environment.numberOfProtozoa();
 		if (pop <= 0) {
-			// Extinct: don't update. Reset integral so when life returns
-			// we don't yank the world into an over-tight state.
+			// Extinct: spawn a fresh seeded cohort so the sim keeps running.
+			// Reset PID integral so we don't yank the freshly-respawned
+			// world into an over-tight state on the first tick.
 			pidIntegral = 0f;
 			pidLastError = Float.NaN;
+			respawnProtozoaIfExtinct();
 			return;
 		}
 
@@ -420,7 +440,7 @@ public class Simulation implements Runnable
 
 		// Log roughly every 30 seconds so an overnight run leaves a record
 		// of how the controller reacted, without spamming during steady state.
-		long now = System.currentTimeMillis();
+		long now = (long)(environment.getElapsedTime() * 1000);
 		if (pidLastLogMs == 0 || now - pidLastLogMs > 30_000L) {
 			int plantPop = environment.getCount(com.protoevo.biology.cells.PlantCell.class);
 			float plantCtrl = PLANT_PID_KP * ((plantPop - homeostasisTargetPlants) / (float) homeostasisTargetPlants)
@@ -434,8 +454,65 @@ public class Simulation implements Runnable
 					plantPop, homeostasisTargetPlants, plantCtrl,
 					mul(GAIN_PLANT_PHOTOSYNTHESIS * plantCtrl),
 					mul(GAIN_PLANT_SPLIT_RATE * plantCtrl));
+
+			// Diagnostic: what's actually inside a typical protozoan? If
+			// avgFood > 0 but avgConstrMass ≈ 0 the digest path isn't
+			// converting. If avgFood ≈ 0 too, eat isn't filling food. If
+			// avgEnergy stays low even after the food-bug fixes, the
+			// problem is the energy economy, not the food pipeline.
+			double sumE = 0, sumCM = 0, sumFood = 0, sumR = 0, sumAge = 0;
+			int n = 0, engulfing = 0, withMass = 0;
+			for (com.protoevo.biology.cells.Cell c : environment.getCells()) {
+				if (!(c instanceof com.protoevo.biology.cells.Protozoan)) continue;
+				com.protoevo.biology.cells.Protozoan p = (com.protoevo.biology.cells.Protozoan) c;
+				if (p.isDead()) continue;
+				sumE += p.getEnergyAvailable();
+				sumCM += p.getConstructionMassAvailable();
+				if (p.getConstructionMassAvailable() > 1e-9f) withMass++;
+				for (com.protoevo.biology.Food f : p.getFoodToDigest().values())
+					sumFood += f.getSimpleMass();
+				sumR += p.getRadius();
+				sumAge += p.getTimeAlive();
+				if (!p.getEngulfedCells().isEmpty()) engulfing++;
+				n++;
+			}
+			if (n > 0) {
+				System.out.printf("[diag] n=%d avgE=%.1f/%.0f  avgCM=%.5g  avgFood=%.5g  "
+						+ "avgR=%.4f  avgAge=%.1fs  engulfing=%d  withMass=%d%n",
+						n, sumE / n,
+						Environment.settings.cell.energyCapFactor.get() * (sumR / n)
+								/ Environment.settings.minParticleRadius.get(),
+						sumCM / n, sumFood / n, sumR / n, sumAge / n,
+						engulfing, withMass);
+			}
+
+			// What's actually killing things this window? Drains the
+			// per-cause counters from Environment so the next window
+			// reports a fresh delta. Empty maps print as "[deaths] none"
+			// so the line is grep-able either way.
+			logDeathCauses("protozoa", environment.drainProtozoaDeaths());
+			logDeathCauses("plants  ", environment.drainPlantDeaths());
+
 			pidLastLogMs = now;
 		}
+	}
+
+	private static void logDeathCauses(String label,
+			java.util.Map<com.protoevo.biology.CauseOfDeath, Integer> counts) {
+		if (counts == null || counts.isEmpty()) {
+			System.out.printf("[deaths %s] none%n", label);
+			return;
+		}
+		// Print highest-count first so the dominant killer is immediately visible.
+		java.util.List<java.util.Map.Entry<com.protoevo.biology.CauseOfDeath, Integer>>
+				sorted = new java.util.ArrayList<>(counts.entrySet());
+		sorted.sort((a, b) -> Integer.compare(b.getValue(), a.getValue()));
+		StringBuilder sb = new StringBuilder();
+		for (java.util.Map.Entry<com.protoevo.biology.CauseOfDeath, Integer> e : sorted) {
+			if (sb.length() > 0) sb.append(", ");
+			sb.append(e.getKey().name()).append("=").append(e.getValue());
+		}
+		System.out.printf("[deaths %s] %s%n", label, sb.toString());
 	}
 
 	private void plantHomeostasisTick() {
@@ -479,6 +556,211 @@ public class Simulation implements Runnable
 		if (x >  MAX_LOG_DEVIATION) x =  MAX_LOG_DEVIATION;
 		if (x < -MAX_LOG_DEVIATION) x = -MAX_LOG_DEVIATION;
 		return (float) Math.exp(x);
+	}
+
+	// ===== Selection-pressure ratchet =====
+	//
+	// Monotonic difficulty escalator separate from the PID. The PID keeps the
+	// population near its target; the ratchet makes the *task* harder over
+	// time so lineages can never coast. PhagocyticReceptor uses match^(1+p)
+	// as digestion efficiency, where p is the ratcheted exponent — higher p
+	// means partial signature matches digest worse and worse.
+	//
+	// Ratchet rules:
+	//   * Only fires every RATCHET_INTERVAL sim-seconds (delay so a transient
+	//     stable patch doesn't multiply pressure).
+	//   * Population must be at least RATCHET_POP_FRACTION (80%) of target.
+	//     A world stable at 400/500 still ratchets — only an actively
+	//     crashing or much-under population is filtered out.
+	//   * |derivative| of error must be small (don't tighten while population
+	//     is changing fast either direction).
+	//   * Only goes UP, never down. Cap at MAX_PRESSURE so it can't drive
+	//     evolution to literal impossibility.
+	// Bumped 60 → 240 sim-seconds. The 60-second cadence was firing 4
+	// simultaneous tightening steps (exponent, plant MIN_RUN, protozoa
+	// MIN_RUN, and base efficiency) every cycle. After 3-4 cycles
+	// (~3 sim-minutes), engulfBaseEfficiency had dropped from 1.0 to
+	// ~0.6, which is enough to choke off engulf feeding — cells without
+	// well-evolved receptors stopped digesting effectively, switched to
+	// chemical-drip-only survival, and gradually bled out from old age.
+	// 240-second cadence (4 sim-minutes per step) gives ~30 sim-minutes
+	// for the receptor system to fully tighten — long enough for several
+	// reproductive cycles per step, so evolution can actually track
+	// each new constraint before the next one lands.
+	private static final float RATCHET_INTERVAL  = 240f;
+	private static final float RATCHET_STEP      = 0.05f; // exponent step
+	private static final float MAX_PRESSURE      = 3.0f;  // hard cap (match⁴ digest)
+	private static final float STABLE_DERIV_LIMIT = 0.05f; // |dError/dt| below this counts as stable
+	// Caps for the MIN_RUN ratchet — sequence lengths are 50 (plant) and 75
+	// (protozoa), so caps at 30% and ~27% leave headroom even after
+	// substantial signature drift. Going higher than this risks the
+	// signature-drift rate outrunning the receptor-evolution rate and
+	// crashing the population.
+	private static final int   MAX_PLANT_MIN_RUN    = 15;
+	// Cap raised from 20 → 35 so the ratchet still has climbing room
+	// above the new PhagocyticReceptor PROTOZOA_MIN_RUN_FLOOR (24).
+	// 35 of 75 = 47% of sequence — borderline impossible even with
+	// strong evolutionary pressure; effectively a hard ceiling on the
+	// cannibalism arms race.
+	private static final int   MAX_PROTOZOA_MIN_RUN = 35;
+	private float lastRatchetSimTime = -RATCHET_INTERVAL;  // -interval so first eligible tick fires
+
+	// What fraction of the target population is "close enough to stable" to
+	// count as ratchet-eligible? 0.8 = if the world settles at 80% of
+	// target and stays there, that's a valid (if slightly undersized)
+	// equilibrium — the ratchet still fires so the difficulty curve doesn't
+	// stall just because the world isn't QUITE at the nominal target.
+	// Previously this was 1.0 (strict >= target), which meant a world that
+	// settled at 480/500 would never tighten.
+	private static final float RATCHET_POP_FRACTION = 0.8f;
+
+	private void maybeRatchetSelection() {
+		float now = environment.getElapsedTime();
+		if (now - lastRatchetSimTime < RATCHET_INTERVAL) return;
+
+		int pop = environment.numberOfProtozoa();
+		// Ratchet-eligibility threshold lowered from `pop >= target` to
+		// `pop >= target × 0.8`. Combined with the stability check below,
+		// this means "the world is stable at or close-to target", not the
+		// strict "at-or-over target" that left a slightly-undersized
+		// equilibrium permanently un-ratcheted. The pressure still scales
+		// only with stability — a crashing population (pop falling fast)
+		// is filtered out by the derivative check, regardless of absolute
+		// pop level.
+		if (pop < homeostasisTargetPop * RATCHET_POP_FRACTION) return;
+
+		// Use the most recent derivative the PID just computed. NaN guard
+		// because the very first homeostat tick has no history.
+		float deriv = Float.isNaN(pidLastError) ? 0f
+				: (((float) pop - homeostasisTargetPop) / homeostasisTargetPop - pidLastError)
+						/ homeostasisInterval;
+		if (Math.abs(deriv) > STABLE_DERIV_LIMIT) return; // changing fast — wait
+
+		boolean stepped = false;
+
+		// 1. Exponent ratchet (digestion-efficiency curve gets steeper).
+		float current = Environment.settings.cell.selectionPressureExponent.get();
+		if (current < MAX_PRESSURE) {
+			float next = Math.min(MAX_PRESSURE, current + RATCHET_STEP);
+			Environment.settings.cell.selectionPressureExponent.set(next);
+			System.out.printf(
+					"[ratchet] selectionPressureExponent %.3f -> %.3f  (digest = match^%.2f)%n",
+					current, next, 1f + next);
+			stepped = true;
+		}
+
+		// 2. MIN_RUN ratchet (engulf gate gets stricter). Independent of the
+		//    exponent ratchet — both can fire on the same tick. Without this
+		//    second axis, a stable population at high exponent + low MIN_RUN
+		//    would coast on weak receptors that scrape past a tiny gate;
+		//    raising the gate forces co-evolution of longer binding regions.
+		int curPlantRun = Environment.settings.cell.plantEngulfMinRun.get();
+		if (curPlantRun < MAX_PLANT_MIN_RUN) {
+			int next = curPlantRun + 1;
+			Environment.settings.cell.plantEngulfMinRun.set(next);
+			System.out.printf(
+					"[ratchet] plantEngulfMinRun %d -> %d (of 50)%n",
+					curPlantRun, next);
+			stepped = true;
+		}
+		int curProtoRun = Environment.settings.cell.protozoaEngulfMinRun.get();
+		if (curProtoRun < MAX_PROTOZOA_MIN_RUN) {
+			int next = curProtoRun + 1;
+			Environment.settings.cell.protozoaEngulfMinRun.set(next);
+			System.out.printf(
+					"[ratchet] protozoaEngulfMinRun %d -> %d (of 75)%n",
+					curProtoRun, next);
+			stepped = true;
+		}
+
+		// 3. Engulf base efficiency ratchet (digestion floor gets lower).
+		//    Drops from 1.0 (receptor system off — every engulf is full
+		//    efficiency) toward 0.02 (the original hard floor — only good
+		//    matches digest well). Geometric decay: each step multiplies
+		//    by 0.85 so the floor halves every ~4 ratchet ticks (~4 min
+		//    sim time at the default RATCHET_INTERVAL=60). Lineages have
+		//    plenty of generations to evolve specific receptors before
+		//    the floor approaches the hard minimum.
+		float curBase = Environment.settings.cell.engulfBaseEfficiency.get();
+		if (curBase > 0.02f) {
+			float next = Math.max(0.02f, curBase * 0.85f);
+			Environment.settings.cell.engulfBaseEfficiency.set(next);
+			System.out.printf(
+					"[ratchet] engulfBaseEfficiency %.3f -> %.3f%n",
+					curBase, next);
+			stepped = true;
+		}
+
+		if (stepped)
+			lastRatchetSimTime = now;
+	}
+
+	// ===== Auto-respawn on extinction =====
+	//
+	// When all protozoa die, spawn a fresh seeded cohort so the sim keeps
+	// running unattended. New cells get a plantReceptorKey copied from
+	// some live plant's surface signature → they can immediately eat that
+	// plant lineage at full rate. Their protozoa receiving / phagocytic
+	// receptors are fresh independent random sequences (so they can't
+	// kin-cannibalize, same logic as initialisePopulation).
+	//
+	// If there are no live plants either, we don't respawn — that would
+	// just spawn cells with no food. The sim continues running empty
+	// and the user can fix it manually.
+	private static final int RESPAWN_PROTOZOA_COUNT = 250;
+
+	private void respawnProtozoaIfExtinct() {
+		if (environment == null) return;
+		if (environment.numberOfProtozoa() > 0) return;
+
+		// Find a representative live plant to align the new protozoa keys to.
+		com.protoevo.biology.cells.PlantCell anchor = null;
+		for (com.protoevo.biology.cells.Cell c : new java.util.ArrayList<>(environment.getCells())) {
+			if (c instanceof com.protoevo.biology.cells.PlantCell && !c.isDead()) {
+				anchor = (com.protoevo.biology.cells.PlantCell) c;
+				break;
+			}
+		}
+		com.protoevo.biology.evolution.AminoAcidSequence anchorSig =
+				anchor == null ? null : anchor.getSurfaceSignature();
+		if (anchorSig == null) {
+			System.out.println("[respawn] no live plants found; skipping respawn so we don't spawn starvers.");
+			return;
+		}
+
+		// Fresh independent keys for the protozoa-on-protozoa side so the
+		// new cohort can't immediately kin-cannibalize.
+		com.protoevo.biology.evolution.AminoAcidSequence freshReceiving =
+				new com.protoevo.biology.evolution.AminoAcidSequence(
+						com.protoevo.biology.evolution.ProtozoaSignatureTrait.LENGTH);
+		com.protoevo.biology.evolution.AminoAcidSequence freshPhag =
+				new com.protoevo.biology.evolution.AminoAcidSequence(
+						com.protoevo.biology.evolution.ProtozoaSignatureTrait.LENGTH);
+
+		int target = Math.min(RESPAWN_PROTOZOA_COUNT,
+				environment.getGlobalCapacity(com.protoevo.biology.cells.Protozoan.class));
+		int spawned = 0;
+		for (int i = 0; i < target; i++) {
+			try {
+				com.protoevo.biology.cells.Protozoan p =
+						com.protoevo.biology.evolution.Evolvable.createNew(
+								com.protoevo.biology.cells.Protozoan.class);
+				p.setPlantReceptorKey(
+						new com.protoevo.biology.evolution.AminoAcidSequence(anchorSig));
+				p.setProtozoaReceivingReceptor(
+						new com.protoevo.biology.evolution.AminoAcidSequence(freshReceiving));
+				p.setProtozoaPhagocyticReceptor(
+						new com.protoevo.biology.evolution.AminoAcidSequence(freshPhag));
+				p.setEnvironmentAndBuildPhysics(environment);
+				environment.findRandomPositionOrKillCell(p);
+				spawned++;
+			} catch (Throwable t) {
+				// If anything goes wrong creating a cell, skip it; we still
+				// want to spawn as many as possible.
+			}
+		}
+		System.out.printf("[respawn] extinction detected — spawned %d new protozoa, keys seeded against plant lineage with sig %s%n",
+				spawned, anchorSig.toString());
 	}
 
 	public boolean isHomeostasisEnabled() { return homeostasisEnabled; }
@@ -603,7 +885,7 @@ public class Simulation implements Runnable
 			float maxStableStep = baseDt * Math.min(64f, Math.max(8f, td / 4f));
 			// Per-render-frame cap on the number of big steps. Above this the
 			// sim just won't keep up — better to run slow than hang.
-			int maxStepsPerFrame = 16;
+			int maxStepsPerFrame = 128;
 
 			try {
 				// Chemicals AND plant/meat updates are batched once per render
@@ -722,6 +1004,17 @@ public class Simulation implements Runnable
 		String timeStamp = Utils.getTimeStampString();
 		String fileName = getSaveFolder() + "/env/" + timeStamp;
 		Serialization.saveEnvironment(environment, fileName);
+
+		// Dump a human/AI-readable report on whatever lineage is currently
+		// dominant. Lets us inspect what evolution actually built without
+		// having to deserialize the binary env file.
+		try {
+			com.protoevo.core.DominantLineageReport.write(
+					environment, getSaveFolder() + "/dominant_lineage.txt");
+		} catch (Throwable t) {
+			System.out.println("[dominant-lineage] failed: " + t.getMessage());
+		}
+
 		return fileName;
 	}
 

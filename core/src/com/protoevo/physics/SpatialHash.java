@@ -215,4 +215,30 @@ public class SpatialHash<T> implements Serializable, Iterable<Collection<T>> {
         int idx = getChunkIndex(i, j);
         return getChunkContents(idx);
     }
+
+    /**
+     * Return all entries in chunks overlapping a circle of given radius
+     * around the world-space position. Used by the custom physics engine
+     * for broad-phase collision detection — query is O(K) where K is the
+     * number of entries in the few overlapping chunks, vs O(N) for a
+     * naive scan over all particles.
+     *
+     * The returned list MAY contain entries outside the actual circle
+     * (we don't filter by per-entry position — that's the caller's job
+     * if they need exact narrow-phase). Walking chunks is much cheaper
+     * than narrow-phase, so over-reporting is fine.
+     */
+    public java.util.List<T> getNearbyEntries(Vector2 pos, float radius) {
+        int rChunks = (int) Math.ceil(radius / chunkSize) + 1;
+        int cx = getChunkX(pos.x);
+        int cy = getChunkY(pos.y);
+        java.util.List<T> out = new java.util.ArrayList<>(8);
+        for (int di = -rChunks; di <= rChunks; di++) {
+            for (int dj = -rChunks; dj <= rChunks; dj++) {
+                Collection<T> chunk = getChunkContents(cx + di, cy + dj);
+                if (!chunk.isEmpty()) out.addAll(chunk);
+            }
+        }
+        return out;
+    }
 }

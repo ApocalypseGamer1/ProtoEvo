@@ -1,7 +1,6 @@
 package com.protoevo.physics;
 
 import com.badlogic.gdx.math.Vector2;
-import com.protoevo.physics.box2d.Box2DParticle;
 
 import java.io.Serializable;
 import java.util.Optional;
@@ -189,12 +188,15 @@ public class Joining implements Serializable {
     }
 
     public float getIdealLength() {
+        // Was: cast to Box2DParticle. Reverted to the abstract Particle type
+        // so jolt-package particles can also participate in joinings — the
+        // cast was a leak from when Box2D was the only backend.
         Optional<Particle> maybeA = getParticleA();
         Optional<Particle> maybeB = getParticleB();
         if (!maybeA.isPresent() || !maybeB.isPresent())
             return 0;
-        Box2DParticle particleA = (Box2DParticle) maybeA.get();
-        Box2DParticle particleB = (Box2DParticle) maybeB.get();
+        Particle particleA = maybeA.get();
+        Particle particleB = maybeB.get();
 
         float len = JointsManager.idealJoinedParticleDistance(particleA, particleB);
         if (!anchoredA)

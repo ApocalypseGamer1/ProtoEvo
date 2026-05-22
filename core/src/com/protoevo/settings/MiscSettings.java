@@ -91,7 +91,7 @@ public class MiscSettings extends Settings {
     public final Parameter<String> physicsEngine = new Parameter<>(
             "Physics Engine",
             "Which physics backend to use: \"box2d\" or \"jolt\".",
-            "box2d"
+            "jolt"
     );
 
 

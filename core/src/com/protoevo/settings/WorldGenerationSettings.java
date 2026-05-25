@@ -71,7 +71,11 @@ public class WorldGenerationSettings extends Settings {
     public final Parameter<Float> voidStartDistance = new Parameter<>(
             "Void Start Distance",
             "Distance from the centre of the environment where the void starts.",
-            1.25f * radius.get());
+            // Was 1.25 × radius — too thin a buffer between rocks and void.
+            // Cells slipping through a ring break landed in void almost
+            // immediately. 2.0× gives a forgiving collar where wandering is
+            // safe.
+            2.0f * radius.get());
 
     public final Parameter<Float> spatialHashRadius = new Parameter<>(
             "",

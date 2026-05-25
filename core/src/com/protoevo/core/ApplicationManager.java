@@ -111,6 +111,15 @@ public class ApplicationManager {
     }
 
     public void setSimulation(Simulation simulation) {
+        // If the same Simulation is being re-attached (e.g. GraphicsAdapter.create()
+        // calls loadSimulation->setSimulation after main() already started a prep
+        // thread), do NOT spawn a second prepare() — that races on the shared Box2D
+        // world's b2BlockAllocator and crashes the JVM. Just notify if ready.
+        if (this.simulation == simulation && preparationThread != null) {
+            if (simulation.isReady())
+                notifySimulationReady();
+            return;
+        }
         disposeSimulationIfPresent();
         this.simulation = simulation;
         simulation.setManager(this);

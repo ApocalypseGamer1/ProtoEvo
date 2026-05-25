@@ -34,6 +34,7 @@ public class SimulationInputManager {
     private final MoveParticleButton moveParticleButton;
     private final LightningButton lightningButton;
     private final InputLayers inputLayers;
+    private PanZoomCameraInput panZoomCameraInput;
 
     private final SelectBox<String> spawnableToSpawnSelectBox;
     private final Map<String, Supplier<Spawnable>> possibleSpawnables = new HashMap<>();
@@ -46,7 +47,7 @@ public class SimulationInputManager {
         inputLayers = new InputLayers(simulationScreen.getStage(), new ToggleDebug());
         inputLayers.addLayer(new SimulationKeyboardControls(simulationScreen));
         inputLayers.addLayer(new ShockwaveForcesInput(simulationScreen));
-        PanZoomCameraInput panZoomCameraInput = new PanZoomCameraInput(camera);
+        panZoomCameraInput = new PanZoomCameraInput(camera);
         panZoomCameraInput.setOnPanOrZoomCallback(simulationScreen::disableMeandering);
 
         topBar = simulationScreen.getTopBar();
@@ -232,5 +233,9 @@ public class SimulationInputManager {
     public void dispose() {
         MoveParticleButton.dispose();
         LightningButton.dispose();
+    }
+
+    public PanZoomCameraInput getPanZoomCameraInput() {
+        return panZoomCameraInput;
     }
 }

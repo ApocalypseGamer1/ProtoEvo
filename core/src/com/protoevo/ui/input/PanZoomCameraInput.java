@@ -12,6 +12,10 @@ public class PanZoomCameraInput extends InputAdapter {
 
     private boolean panningDisabled = false;
     public static final float maxZoomOut = 10f;
+    // Floor on zoom-in. Without it a user can multiplicatively scroll
+    // themselves down to zoom~1e-30 and the world is an unrecognisable
+    // pixel; getting back out takes ~150 scroll-wheel ticks. Clamp.
+    public static final float minZoomIn  = 0.05f;
     private Runnable onPanOrZoom = () -> {};
 
     public PanZoomCameraInput(OrthographicCamera cam) {
@@ -53,9 +57,18 @@ public class PanZoomCameraInput extends InputAdapter {
     @Override
     public boolean scrolled(float amountX, float amountY) {
         cam.zoom *= amountY > 0 ? 1.05f : 0.95f;
-        cam.zoom = Math.min(cam.zoom, maxZoomOut);
+        cam.zoom = Math.max(minZoomIn, Math.min(cam.zoom, maxZoomOut));
         onPanOrZoom.run();
         return false;
+    }
+
+    /** Reset zoom and re-center. Used by the keyboard 'R' / Home binding to
+     *  rescue a viewer who scrolled themselves into a pixel. */
+    public void resetView() {
+        cam.zoom = 1f;
+        cam.position.set(0f, 0f, 0f);
+        cam.update();
+        onPanOrZoom.run();
     }
 
 }

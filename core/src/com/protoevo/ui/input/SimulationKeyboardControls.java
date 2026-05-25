@@ -18,6 +18,20 @@ public class SimulationKeyboardControls extends InputAdapter {
         this.simulation = simulationScreen.getSimulation();
         this.screen = simulationScreen;
 
+        // Reset camera (zoom + position). Rescues a viewer who scrolled
+        // themselves down to zoom=1e-9 and can't recover with the wheel.
+        Runnable resetCamera = () -> {
+            var im = screen.getInputManager();
+            if (im != null && im.getPanZoomCameraInput() != null)
+                im.getPanZoomCameraInput().resetView();
+        };
+        keyFunctions.put(Input.Keys.R, resetCamera);
+        keyFunctions.put(Input.Keys.HOME, resetCamera);
+
+        // F6 toggles adaptive speed (sim auto-bumps td up while frame budget
+        // has headroom, backs off when render starts to choke).
+        keyFunctions.put(Input.Keys.F6, () -> simulation.setAutoSpeed(!simulation.isAutoSpeedEnabled()));
+
         keyFunctions.put(Input.Keys.SPACE, simulation::togglePause);
         keyFunctions.put(Input.Keys.F12, screen::toggleUI);
         keyFunctions.put(Input.Keys.F4, screen::toggleLineageOverlay);

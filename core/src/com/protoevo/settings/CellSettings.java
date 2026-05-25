@@ -87,6 +87,27 @@ public class CellSettings extends Settings {
             + "Ratcheted up by the homeostat when population is stable.",
             12);
 
+    // Smooth replacement for the plant-side contiguous-run gate. The
+    // plant signature drift is the plant's only defense (sessile, no
+    // spikes, no movement) — so we still need a gate keeping unmatched
+    // protozoa from engulfing arbitrary plants. But the run-based gate
+    // was a 1-mutation cliff (random sequences rarely produce long runs;
+    // any single residue mutation breaks an existing run). This identity-
+    // fraction gate is the same idea but with a smooth gradient: every
+    // +1% identity is a step closer to passing, so evolution can climb
+    // it incrementally instead of waiting for an improbable contiguous
+    // match to appear by chance.
+    //
+    //   Random alphabet-20 pairs: ~0.05 identity expected.
+    //   Start gate: 0.10 (10%) — small co-evolution buffer above random.
+    //   Ratchet: each step +0.02.
+    //   Cap: 0.30 (30%) — substantial co-evolution required but achievable.
+    public Parameter<Float> plantEngulfMinIdentity = new Parameter<>(
+            "Plant Engulf Min Identity",
+            "Minimum receptor-vs-plant-signature identity (0..1) required to engulf a plant. "
+            + "Smooth-gradient replacement for plantEngulfMinRun. Ratcheted up by the homeostat.",
+            0.10f);
+
     public Parameter<Float> energyDecayRate = new Parameter<>(
             "Energy Decay Rate",
             "Fractional energy decay coefficient. Effective rate is "

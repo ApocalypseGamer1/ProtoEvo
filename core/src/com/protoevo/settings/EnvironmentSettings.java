@@ -35,7 +35,13 @@ public class EnvironmentSettings extends Settings {
     public final Parameter<Float> voidDamagePerSecond = new Parameter<>(
             "Void Damage Per Second",
             "Factor controlling how much damage being outside the environment does.",
-            10f);
+            // Was 10 (cell dead in ~10s of void exposure). With ring-break
+            // probability 0.05 and modest cell speeds, cells routinely drift
+            // outside through gaps and don't make it back in 10s. 2 (50s
+            // tolerance) gives chemoreception time to re-attract them
+            // before they die. Cumulative void-deaths dominated every run
+            // before this change.
+            2f);
 
     public final Parameter<Boolean> dayNightCycleEnabled = new Parameter<>(
             "Day/Night Cycle Enabled",

@@ -33,6 +33,38 @@ public class Simulation implements Runnable
 	private volatile boolean simulate, saveRequested = false, busyOnOtherThread = false;
 	private static boolean paused = false;
 	private float timeDilation = 1, timeSinceSave = 0, timeSinceSnapshot = 0, timeSinceAutoSave = 0;
+
+	// Adaptive-speed controller. Bumps timeDilation up when sim has CPU
+	// headroom, backs off when render frames start exceeding budget — so
+	// the world runs as fast as the host can render without ever degrading
+	// the streamed framerate. Disabled by manual speed changes (`[`/`]`/`\`)
+	// and re-enabled by toggleAutoSpeed (F6).
+	private boolean autoSpeed = true;
+	private float   autoSpeedMaxTd  = 32f;   // hard cap
+	private float   autoSpeedMinTd  = 1.0f;  // NEVER below real-time. The
+	                                          // earlier 0.5 floor produced a
+	                                          // self-fulfilling slowdown when
+	                                          // update() consistently breached
+	                                          // the back-off threshold: td → 0.5,
+	                                          // update still >33ms, no
+	                                          // headroom to climb back. With
+	                                          // floor=1.0 the renderer drops
+	                                          // FPS instead of the sim slowing
+	                                          // down — same wall-time progress.
+	private double  emaFrameMs      = 16.0;
+	private static final double EMA_ALPHA   = 0.20;
+	// Targets relaxed: Box2D step time on a real population (2k bodies) is
+	// 25–35ms even at td=1.0; the previous 16/33ms targets meant we were
+	// always "over budget" and never accumulated upward momentum. New band:
+	//   * bump up only when EMA < 40ms (≥25fps budget actually has slack)
+	//   * back off only when EMA > 80ms (sim+render eating >12fps budget)
+	private static final double TARGET_LOW  = 40.0;
+	private static final double TARGET_HIGH = 80.0;
+	// Telemetry: log td/EMA once every ~3 sim seconds at td=1, less often at
+	// higher td so we don't spam the journal but can still see what's
+	// happening on a long run.
+	private double lastAutoSpeedLogMs = 0.0;
+	private long   lastFrameNanos    = 0;
 	private TimedEventsManager timedEventsManager;
 	
 	public static Random RANDOM = new Random(Environment.settings.simulationSeed.get());
@@ -283,8 +315,13 @@ public class Simulation implements Runnable
 	// Aligning target with the spawn size lets the new cohort settle
 	// without immediate hostile pressure; the natural selection-pressure
 	// ratchet still tightens the world over time.
-	private int homeostasisTargetPop = 500;
-	private int homeostasisTargetPlants = 1000;
+	// Lowered from 500/1000. At 500 protozoa + 1000 plants in this env
+	// radius, plants overcrowd → protozoa suffocate inside plant overlap →
+	// pop collapses → ratchet stuck → world freezes. With 250/600 there's
+	// physical room for each cell to navigate without colliding into a
+	// bigger plant within 1.5× its radius (the SUFFOCATION trigger).
+	private int homeostasisTargetPop = 250;
+	private int homeostasisTargetPlants = 600;
 	private float homeostasisInterval = 5f; // sim-seconds between updates
 
 	// PID gains. Levers are all *natural* parameters (food density, decay,
@@ -407,6 +444,9 @@ public class Simulation implements Runnable
 			respawnProtozoaIfExtinct();
 			return;
 		}
+
+		// Pop alive but pathologically small — supplement without replacing.
+		maybeSupplementProtozoa();
 
 		// Normalized error: positive = over target, negative = under.
 		float error = ((float) pop - homeostasisTargetPop) / (float) homeostasisTargetPop;
@@ -597,6 +637,11 @@ public class Simulation implements Runnable
 	// signature-drift rate outrunning the receptor-evolution rate and
 	// crashing the population.
 	private static final int   MAX_PLANT_MIN_RUN    = 15;
+	// Smooth plant-engulf identity-fraction gate. 0.30 = 30% identity =
+	// substantial co-evolution. Random pairs are at ~0.05, gate starts
+	// at 0.10 (in CellSettings default), each ratchet step adds 0.02.
+	private static final float MAX_PLANT_IDENTITY   = 0.30f;
+	private static final float PLANT_IDENTITY_STEP  = 0.02f;
 	// Cap raised from 20 → 35 so the ratchet still has climbing room
 	// above the new PhagocyticReceptor PROTOZOA_MIN_RUN_FLOOR (24).
 	// 35 of 75 = 47% of sequence — borderline impossible even with
@@ -649,18 +694,20 @@ public class Simulation implements Runnable
 			stepped = true;
 		}
 
-		// 2. MIN_RUN ratchet (engulf gate gets stricter). Independent of the
-		//    exponent ratchet — both can fire on the same tick. Without this
-		//    second axis, a stable population at high exponent + low MIN_RUN
-		//    would coast on weak receptors that scrape past a tiny gate;
-		//    raising the gate forces co-evolution of longer binding regions.
-		int curPlantRun = Environment.settings.cell.plantEngulfMinRun.get();
-		if (curPlantRun < MAX_PLANT_MIN_RUN) {
-			int next = curPlantRun + 1;
-			Environment.settings.cell.plantEngulfMinRun.set(next);
+		// 2. ENGULF-GATE ratchet, two axes:
+		//      a) plantEngulfMinIdentity (smooth identity-fraction gate)
+		//         — replaces the old contiguous-run cliff. Tightens slowly
+		//         (+0.02 per ratchet tick) up to 0.30 (30% identity).
+		//      b) protozoaEngulfMinRun (binary cannibalism gate)
+		//         — kept as-is. Cannibalism is supposed to be a hard wall
+		//         that only co-evolved predator lineages cross.
+		float curPlantId = Environment.settings.cell.plantEngulfMinIdentity.get();
+		if (curPlantId < MAX_PLANT_IDENTITY) {
+			float next = Math.min(MAX_PLANT_IDENTITY, curPlantId + PLANT_IDENTITY_STEP);
+			Environment.settings.cell.plantEngulfMinIdentity.set(next);
 			System.out.printf(
-					"[ratchet] plantEngulfMinRun %d -> %d (of 50)%n",
-					curPlantRun, next);
+					"[ratchet] plantEngulfMinIdentity %.3f -> %.3f%n",
+					curPlantId, next);
 			stepped = true;
 		}
 		int curProtoRun = Environment.settings.cell.protozoaEngulfMinRun.get();
@@ -674,16 +721,28 @@ public class Simulation implements Runnable
 		}
 
 		// 3. Engulf base efficiency ratchet (digestion floor gets lower).
-		//    Drops from 1.0 (receptor system off — every engulf is full
-		//    efficiency) toward 0.02 (the original hard floor — only good
-		//    matches digest well). Geometric decay: each step multiplies
-		//    by 0.85 so the floor halves every ~4 ratchet ticks (~4 min
-		//    sim time at the default RATCHET_INTERVAL=60). Lineages have
-		//    plenty of generations to evolve specific receptors before
-		//    the floor approaches the hard minimum.
+		//    Originally decayed 0.85/step toward 0.02, which crashed the pop
+		//    early: by ratchet tick 3 the floor was 0.61, and fresh-lineage
+		//    cells (mediocre key match) couldn't feed fast enough to outpace
+		//    void/crowd/starvation deaths. Pop spiraled to 40% target and
+		//    the homeostat then disqualified further ratchet steps but the
+		//    damage was already done.
+		//
+		//    New decay: 0.92/step toward 0.20. Same monotonic shape but
+		//      - decay much shallower (8%/step instead of 15%) so even by
+		//        tick 10 the floor is still ~0.43,
+		//      - floor at 0.20 (not 0.02) so even mismatched lineages keep
+		//        a baseline feed rate — selection happens via the EXPONENT
+		//        and MIN_RUN axes, this one just prevents the world from
+		//        becoming flat-uneatable.
+		// Floor raised from 0.20 to 0.40. With the plant gate removed, the
+		// efficiency curve IS the entire plant-feeding selector — a hard
+		// floor at 0.20 made even perfect-match keys feed at only 20% of
+		// the historic baseline. 0.40 preserves selection pressure while
+		// keeping the world feed-able.
 		float curBase = Environment.settings.cell.engulfBaseEfficiency.get();
-		if (curBase > 0.02f) {
-			float next = Math.max(0.02f, curBase * 0.85f);
+		if (curBase > 0.40f) {
+			float next = Math.max(0.40f, curBase * 0.92f);
 			Environment.settings.cell.engulfBaseEfficiency.set(next);
 			System.out.printf(
 					"[ratchet] engulfBaseEfficiency %.3f -> %.3f%n",
@@ -708,6 +767,29 @@ public class Simulation implements Runnable
 	// just spawn cells with no food. The sim continues running empty
 	// and the user can fix it manually.
 	private static final int RESPAWN_PROTOZOA_COUNT = 250;
+
+	// Supplementation: when pop is alive but stuck at < 20% target, the
+	// existing evolved lineage often can't grow on its own (too few cells,
+	// too much plant overlap pressure). Periodically inject a small number
+	// of fresh plant-aligned cells WITHOUT replacing the evolved lineage,
+	// so it gets the numbers it needs to push generations forward. Throttled
+	// to once per SUPPLEMENT_COOLDOWN sim-seconds so we don't flood.
+	// Tuned harder than the first iteration. The earlier values
+	// (count=30, cooldown=300 sim-sec, fraction=0.2) at auto-speed td=32×
+	// translated to a supplement every ~10 sec wall-clock, flooding the
+	// gene pool with gen-0 naive cells faster than the established
+	// lineage could reproduce. genMean stuck around 1.3 — the
+	// supplement was actively suppressing the evolution it was meant
+	// to rescue. New tuning:
+	//   * count 15 — half the prior dose
+	//   * cooldown 1800 sim-sec — at td=32× ≈ 1 min wall, at td=1× = 30 min
+	//   * fraction 0.10 — only fire when pop drops under 10% target
+	//     (25 cells at the default 250 target), so the established
+	//     lineage has room to recover on its own first
+	private static final int SUPPLEMENT_COUNT = 15;
+	private static final float SUPPLEMENT_COOLDOWN = 1800f;
+	private static final float SUPPLEMENT_POP_FRACTION = 0.10f;
+	private float lastSupplementSimTime = -SUPPLEMENT_COOLDOWN;
 
 	private void respawnProtozoaIfExtinct() {
 		if (environment == null) return;
@@ -761,6 +843,59 @@ public class Simulation implements Runnable
 		}
 		System.out.printf("[respawn] extinction detected — spawned %d new protozoa, keys seeded against plant lineage with sig %s%n",
 				spawned, anchorSig.toString());
+	}
+
+	private void maybeSupplementProtozoa() {
+		if (environment == null) return;
+		int pop = environment.numberOfProtozoa();
+		if (pop == 0) return; // extinction handler takes this
+		if (pop >= homeostasisTargetPop * SUPPLEMENT_POP_FRACTION) return;
+		float now = environment.getElapsedTime();
+		if (now - lastSupplementSimTime < SUPPLEMENT_COOLDOWN) return;
+
+		// Anchor to a live plant signature, same as the extinction respawn.
+		com.protoevo.biology.cells.PlantCell anchor = null;
+		for (com.protoevo.biology.cells.Cell c : new java.util.ArrayList<>(environment.getCells())) {
+			if (c instanceof com.protoevo.biology.cells.PlantCell && !c.isDead()) {
+				anchor = (com.protoevo.biology.cells.PlantCell) c;
+				break;
+			}
+		}
+		com.protoevo.biology.evolution.AminoAcidSequence anchorSig =
+				anchor == null ? null : anchor.getSurfaceSignature();
+		if (anchorSig == null) return;
+
+		com.protoevo.biology.evolution.AminoAcidSequence freshReceiving =
+				new com.protoevo.biology.evolution.AminoAcidSequence(
+						com.protoevo.biology.evolution.ProtozoaSignatureTrait.LENGTH);
+		com.protoevo.biology.evolution.AminoAcidSequence freshPhag =
+				new com.protoevo.biology.evolution.AminoAcidSequence(
+						com.protoevo.biology.evolution.ProtozoaSignatureTrait.LENGTH);
+
+		int target = Math.min(SUPPLEMENT_COUNT,
+				environment.getGlobalCapacity(com.protoevo.biology.cells.Protozoan.class));
+		int spawned = 0;
+		for (int i = 0; i < target; i++) {
+			try {
+				com.protoevo.biology.cells.Protozoan p =
+						com.protoevo.biology.evolution.Evolvable.createNew(
+								com.protoevo.biology.cells.Protozoan.class);
+				p.setPlantReceptorKey(
+						new com.protoevo.biology.evolution.AminoAcidSequence(anchorSig));
+				p.setProtozoaReceivingReceptor(
+						new com.protoevo.biology.evolution.AminoAcidSequence(freshReceiving));
+				p.setProtozoaPhagocyticReceptor(
+						new com.protoevo.biology.evolution.AminoAcidSequence(freshPhag));
+				p.setEnvironmentAndBuildPhysics(environment);
+				environment.findRandomPositionOrKillCell(p);
+				spawned++;
+			} catch (Throwable t) {
+				// best-effort; skip on error
+			}
+		}
+		lastSupplementSimTime = now;
+		System.out.printf("[supplement] pop=%d / target=%d (<%.0f%%) — added %d cells with plant-aligned keys%n",
+				pop, homeostasisTargetPop, SUPPLEMENT_POP_FRACTION * 100, spawned);
 	}
 
 	public boolean isHomeostasisEnabled() { return homeostasisEnabled; }
@@ -857,6 +992,7 @@ public class Simulation implements Runnable
 		if (isPaused() || busyOnOtherThread || environment == null)
 			return;
 
+		long frameStartNanos = System.nanoTime();
 		try {
 			// Sim-time advancement model:
 			//   one render call advances sim time by `timeDilation` × baseDt.
@@ -928,7 +1064,36 @@ public class Simulation implements Runnable
 			writeCrashReport(e);
 			System.exit(0);
 		}
+
+		// Adaptive speed: only after a clean frame, update the EMA of
+		// real-time per render-frame and nudge timeDilation accordingly.
+		long elapsedNs = System.nanoTime() - frameStartNanos;
+		double frameMs = elapsedNs / 1_000_000.0;
+		emaFrameMs = (1.0 - EMA_ALPHA) * emaFrameMs + EMA_ALPHA * frameMs;
+		if (autoSpeed && !paused) {
+			float td = timeDilation;
+			if (emaFrameMs < TARGET_LOW && td < autoSpeedMaxTd) {
+				timeDilation = Math.min(autoSpeedMaxTd, td * 1.08f);
+			} else if (emaFrameMs > TARGET_HIGH && td > autoSpeedMinTd) {
+				timeDilation = Math.max(autoSpeedMinTd, td * 0.92f);
+			}
+		}
+		// Periodic telemetry: log td + EMA every ~30 sim-sec so we can see
+		// where the controller is settling without spamming on every frame.
+		lastAutoSpeedLogMs += frameMs;
+		if (lastAutoSpeedLogMs > 30000.0) {
+			lastAutoSpeedLogMs = 0;
+			System.out.printf("[autospeed] td=%.2f  ema=%.1fms  auto=%s%n",
+				timeDilation, emaFrameMs, autoSpeed ? "ON" : "OFF");
+		}
 	}
+
+	public boolean isAutoSpeedEnabled() { return autoSpeed; }
+	public void setAutoSpeed(boolean v) {
+		autoSpeed = v;
+		System.out.println("Auto-speed: " + (v ? "ON" : "OFF"));
+	}
+	public double getEmaFrameMs() { return emaFrameMs; }
 
 	public void writeCrashReport(Exception e) {
 		String crashFolder = getSaveFolder() + "/crash_" + Utils.getTimeStampString();
@@ -1078,7 +1243,14 @@ public class Simulation implements Runnable
 
 	public float getTimeDilation() { return timeDilation; }
 
-	public void setTimeDilation(float td) { timeDilation = td; }
+	public void setTimeDilation(float td) {
+		// Manual speed change disables auto-speed so user input wins.
+		timeDilation = td;
+		if (autoSpeed) {
+			autoSpeed = false;
+			System.out.println("Auto-speed: OFF (manual speed override)");
+		}
+	}
 
     public static boolean isPaused() {
 		return paused;

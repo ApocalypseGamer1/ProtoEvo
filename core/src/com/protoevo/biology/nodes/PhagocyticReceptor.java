@@ -140,9 +140,36 @@ public class PhagocyticReceptor extends NodeAttachment implements Serializable {
             return false;
         // Meat carries no genome; standard checks above are sufficient.
         if (other instanceof MeatCell) return true;
-        // Plant/protozoa engulf needs a CONTIGUOUS run of matching residues
-        // long enough to count as a real binding region.
+        // PLANTS: signature drift is the plant's only defense (sessile,
+        // no spikes, no movement). The gate is REQUIRED so unmatched
+        // protozoa can't mow them down. But the original
+        // longest-contiguous-run gate was a knife-edge — random sequences
+        // almost never produce long runs, and one mutation in either party
+        // breaks an existing run. No smooth gradient for evolution to climb.
+        //
+        // New gate: minimum IDENTITY FRACTION (smooth). signatureMatch()
+        // returns scattered-identity in [0,1]. Random sequences average
+        // 0.05 (1/20 alphabet). A small co-evolution gap (start = 0.10)
+        // means random sequences fail the gate but every +1% identity is
+        // a continuous step closer to passing — evolution can ratchet up
+        // bit by bit instead of needing a specific run to appear by chance.
+        if (other instanceof PlantCell) {
+            return signatureMatch(other) >= engulfMinIdentityFor(other);
+        }
+        // PROTOZOA: keep the contiguous-run gate. Kin-cannibalism is
+        // supposed to be HARD by design — only lineages that actively
+        // co-evolve matching receivers/phagocytic-keys can predate each
+        // other. A binary cliff is the intended shape here.
         return longestRun(other) >= engulfMinRunFor(other);
+    }
+
+    /** Minimum identity-fraction threshold for engulfing a given prey
+     *  cell. Reads from settings so the homeostat ratchet can tighten it
+     *  monotonically while the population is stable. */
+    private float engulfMinIdentityFor(Cell other) {
+        if (other instanceof PlantCell)
+            return Environment.settings.cell.plantEngulfMinIdentity.get();
+        return 0f;
     }
 
     /**
